@@ -2754,6 +2754,36 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
 
     break;
   }
+  case Intrinsic::matrix_column_major_load:
+  case Intrinsic::matrix_column_major_store: {
+    // Replace unstrided matrix loads / stores with single loads / stores.
+
+    bool IsLoad = II->getIntrinsicID() == Intrinsic::matrix_column_major_load;
+
+    auto *Stride = dyn_cast<ConstantInt>(II->getArgOperand(IsLoad ? 1 : 2));
+    // Only optimize if stride is statically available.
+    if (!Stride)
+      break;
+
+    uint64_t Rows =
+          cast<ConstantInt>(II->getArgOperand(IsLoad ? 3 : 4))->getZExtValue();
+    // Only optimize the unstrided cases.
+    if (Stride->getZExtValue() != Rows)
+      break;
+
+    Value *Ptr = II->getArgOperand(IsLoad ? 0 : 1);
+    bool IsVolatile =
+          cast<ConstantInt>(II->getArgOperand(IsLoad ? 2 : 3))->isOne();
+
+    if (IsLoad) {
+      Value *L = Builder.CreateLoad(II->getType(), Ptr, IsVolatile);
+      return replaceInstUsesWith(*II, L);
+    }
+
+    Value *S = Builder.CreateStore(II->getArgOperand(0), Ptr, IsVolatile);
+    replaceInstUsesWith(*II, S);
+    return eraseInstFromFunction(*II);
+  }
   case Intrinsic::matrix_multiply: {
     // Optimize negation in matrix multiplication.
 
