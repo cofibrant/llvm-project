@@ -1448,37 +1448,6 @@ public:
                       Builder);
   }
 
-  // Set elements I..I+NumElts-1 to Block
-  Value *insertVector(Value *Col, unsigned I, Value *Block,
-                      IRBuilder<> &Builder) {
-
-    // First, bring Block to the same size as Col
-    unsigned BlockNumElts =
-        cast<FixedVectorType>(Block->getType())->getNumElements();
-    unsigned NumElts = cast<FixedVectorType>(Col->getType())->getNumElements();
-    assert(NumElts >= BlockNumElts && "Too few elements for current block");
-
-    Block = Builder.CreateShuffleVector(
-        Block, createSequentialMask(0, BlockNumElts, NumElts - BlockNumElts));
-
-    // If Col is 7 long and I is 2 and BlockNumElts is 2 the mask is: 0, 1, 7,
-    // 8, 4, 5, 6
-    SmallVector<int, 16> Mask;
-    unsigned i;
-    for (i = 0; i < I; i++)
-      Mask.push_back(i);
-
-    unsigned VecNumElts =
-        cast<FixedVectorType>(Col->getType())->getNumElements();
-    for (; i < I + BlockNumElts; i++)
-      Mask.push_back(i - I + VecNumElts);
-
-    for (; i < VecNumElts; i++)
-      Mask.push_back(i);
-
-    return Builder.CreateShuffleVector(Col, Block, Mask);
-  }
-
   Value *createMulAdd(Value *Sum, Value *A, Value *B, bool UseFPOp,
                       IRBuilder<> &Builder, bool AllowContraction,
                       unsigned &NumComputeOps) {
@@ -1726,31 +1695,6 @@ public:
     ToRemove.push_back(MatMul);
   }
 
-  /// Given \p Remainder iterations of the the matmul inner loop,
-  /// potentially lower \p Blocksize that is used for the underlying
-  /// vector.
-  unsigned capBlockSize(unsigned BlockSize, unsigned Remainder, Type *EltType) {
-    if (BlockSize <= Remainder)
-      return BlockSize;
-
-    // If the remainder is also a legal type just use it.
-    auto *VecTy = FixedVectorType::get(EltType, Remainder);
-    if (TTI.isTypeLegal(VecTy))
-      return Remainder;
-
-    // Similarly, if the vector is small enough that we don't want
-    // to split further.
-    if (VecTy->getPrimitiveSizeInBits() <= SplitMatmulRemainderOverThreshold)
-      return Remainder;
-
-    // Gradually lower the vectorization factor to cover the
-    // remainder.
-    do {
-      BlockSize /= 2;
-    } while (BlockSize > Remainder);
-    return BlockSize;
-  }
-
   /// Compute \p Result += \p A * \p B for input matrices with left-associating
   /// addition.
   ///
@@ -1761,11 +1705,6 @@ public:
   void emitMatrixMultiply(MatrixTy &Result, const MatrixTy &A,
                           const MatrixTy &B, IRBuilder<> &Builder, bool IsTiled,
                           bool IsScalarMatrixTransposed, FastMathFlags FMF) {
-    const unsigned VF = std::max<unsigned>(
-        TTI.getRegisterBitWidth(TargetTransformInfo::RGK_FixedWidthVector)
-                .getFixedValue() /
-            Result.getElementType()->getPrimitiveSizeInBits().getFixedValue(),
-        1U);
     unsigned R = Result.getNumRows();
     unsigned C = Result.getNumColumns();
     unsigned M = A.getNumColumns();
@@ -1783,54 +1722,43 @@ public:
       // operand. Then move along the K axes and accumulate the columns.  With
       // this the adds can be vectorized without reassociation.
       for (unsigned J = 0; J < C; ++J) {
-        unsigned BlockSize = VF;
         // If Result is zero, we don't need to accumulate in the K==0 iteration.
-        bool isSumZero = isa<ConstantAggregateZero>(Result.getColumn(J));
+        bool IsSumZero = isa<ConstantAggregateZero>(Result.getColumn(J));
+        Value *Sum = IsTiled ? Result.getVector(J) : nullptr;
 
-        for (unsigned I = 0; I < R; I += BlockSize) {
-          // Lower block size to make sure we stay within bounds.
-          BlockSize = capBlockSize(BlockSize, R - I, Result.getElementType());
-          Value *Sum = IsTiled ? Result.extractVector(I, J, BlockSize, Builder)
-                               : nullptr;
-          for (unsigned K = 0; K < M; ++K) {
-            Value *L = A.extractVector(I, K, BlockSize, Builder);
-            Value *RH = Builder.CreateExtractElement(
-                B.getColumn(IsScalarMatrixTransposed ? K : J),
-                IsScalarMatrixTransposed ? J : K);
-            Value *Splat = Builder.CreateVectorSplat(BlockSize, RH, "splat");
-            Sum =
-                createMulAdd(isSumZero && K == 0 ? nullptr : Sum, L, Splat,
-                             IsFP, Builder, FMF.allowContract(), NumComputeOps);
-          }
-          Result.setVector(J,
-                           insertVector(Result.getVector(J), I, Sum, Builder));
+        for (unsigned K = 0; K < M; ++K) {
+          Value *L = A.getVector(K);
+          Value *RH = Builder.CreateExtractElement(
+              B.getColumn(IsScalarMatrixTransposed ? K : J),
+              IsScalarMatrixTransposed ? J : K);
+          Value *Splat = Builder.CreateVectorSplat(R, RH, "splat");
+          Sum =
+              createMulAdd(IsSumZero && K == 0 ? nullptr : Sum, L, Splat,
+                           IsFP, Builder, FMF.allowContract(), NumComputeOps);
         }
+
+        Result.setVector(J, Sum);
       }
     } else {
       // Multiply rows from the second operand with scalars from the first
       // operand. Then move along the K axes and accumulate the rows.  With this
       // the adds can be vectorized without reassociation.
       for (unsigned I = 0; I < R; ++I) {
-        unsigned BlockSize = VF;
-        bool isSumZero = isa<ConstantAggregateZero>(Result.getRow(I));
-        for (unsigned J = 0; J < C; J += BlockSize) {
-          // Lower the vectorization factor to cover the remainder.
-          BlockSize = capBlockSize(BlockSize, C - J, Result.getElementType());
+        bool IsSumZero = isa<ConstantAggregateZero>(Result.getRow(I));
+        Value *Sum = nullptr;
 
-          Value *Sum = nullptr;
-          for (unsigned K = 0; K < M; ++K) {
-            Value *R = B.extractVector(K, J, BlockSize, Builder);
-            Value *LH = Builder.CreateExtractElement(
-                A.getVector(IsScalarMatrixTransposed ? K : I),
-                IsScalarMatrixTransposed ? I : K);
-            Value *Splat = Builder.CreateVectorSplat(BlockSize, LH, "splat");
-            Sum =
-                createMulAdd(isSumZero && K == 0 ? nullptr : Sum, Splat, R,
-                             IsFP, Builder, FMF.allowContract(), NumComputeOps);
-          }
-          Result.setVector(I,
-                           insertVector(Result.getVector(I), J, Sum, Builder));
+        for (unsigned K = 0; K < M; ++K) {
+          Value *R = B.getVector(K);
+          Value *LH = Builder.CreateExtractElement(
+              A.getVector(IsScalarMatrixTransposed ? K : I),
+              IsScalarMatrixTransposed ? I : K);
+          Value *Splat = Builder.CreateVectorSplat(C, LH, "splat");
+          Sum =
+              createMulAdd(IsSumZero && K == 0 ? nullptr : Sum, Splat, R,
+                           IsFP, Builder, FMF.allowContract(), NumComputeOps);
         }
+
+        Result.setVector(I, Sum);
       }
     }
     Result.addNumComputeOps(NumComputeOps);
