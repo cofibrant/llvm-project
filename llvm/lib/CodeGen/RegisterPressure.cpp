@@ -970,6 +970,9 @@ static void computeExcessPressureDelta(ArrayRef<unsigned> OldPressureVec,
     } else if (Limit > PNew)
       PDiff = Limit - POld;   // Just obeyed limit.
 
+    if (POld > 3 * Limit)
+      PDiff = 0;
+
     if (PDiff) {
       Delta.Excess = PressureChange(i);
       Delta.Excess.setUnitInc(PDiff);
@@ -1179,6 +1182,10 @@ getUpwardPressureDelta(const MachineInstr *MI, /*const*/ PressureDiff &PDiff,
         ExcessInc = POld > Limit ? PNew - POld : PNew - Limit;
       else if (POld > Limit)
         ExcessInc = Limit - POld;
+
+      if (POld > 3 * Limit)
+        ExcessInc = 0;
+
       if (ExcessInc) {
         Delta.Excess = PressureChange(PSetID);
         Delta.Excess.setUnitInc(ExcessInc);
