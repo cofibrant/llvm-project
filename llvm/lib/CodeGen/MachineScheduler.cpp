@@ -4023,6 +4023,15 @@ bool GenericScheduler::tryCandidate(SchedCandidate &Cand,
       TryCand.Reason = NodeOrder;
       return true;
     }
+  } else {
+    // Cross-boundary heuristic: prefer the candidate on the more critical path.
+    // For Top candidates, Height indicates downstream work that depends on it.
+    // For Bot candidates, Depth indicates upstream work required.
+    // Prefer the candidate with more dependent work to minimize live ranges.
+    unsigned TryCrit = TryCand.AtTop ? TryCand.SU->getHeight() : TryCand.SU->getDepth();
+    unsigned CandCrit = Cand.AtTop ? Cand.SU->getHeight() : Cand.SU->getDepth();
+    if (tryGreater(TryCrit, CandCrit, TryCand, Cand, TopDepthReduce))
+      return TryCand.Reason != NoCand;
   }
 
   return false;
