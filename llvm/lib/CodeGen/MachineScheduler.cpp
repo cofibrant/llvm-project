@@ -2467,6 +2467,36 @@ void CopyConstrain::apply(ScheduleDAGInstrs *DAGInstrs) {
   }
 }
 
+//==-----------------------------------------------------------------------===//
+// LiveRangeReductionMutation - DAG post-processing to reduce the live ranges of
+// temporaries.
+//==-----------------------------------------------------------------------===//
+
+namespace {
+class LiveRangeReductionMutation : public ScheduleDAGMutation {
+  const TargetInstrInfo *TII;
+  const TargetRegisterInfo *TRI;
+
+public:
+  LiveRangeReductionMutation(const TargetInstrInfo *TII,
+                             const TargetRegisterInfo *TRI)
+      : TII(TII), TRI(TRI) {}
+
+  void apply(ScheduleDAGInstrs *DAGInstrs) override;
+};
+} // end anonymous namespace
+
+std::unique_ptr<ScheduleDAGMutation>
+llvm::createLiveRangeReductionMutation(const TargetInstrInfo *TII,
+                                       const TargetRegisterInfo *TRI) {
+  return std::make_unique<LiveRangeReductionMutation>(TII, TRI);
+}
+
+void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
+  LLVM_DEBUG(dbgs() << "*** Begin live range reduction mutation ***\n");
+  LLVM_DEBUG(dbgs() << "*** End live range reduction mutation ***\n");
+}
+
 //===----------------------------------------------------------------------===//
 // MachineSchedStrategy helpers used by GenericScheduler, GenericPostScheduler
 // and possibly other custom schedulers.

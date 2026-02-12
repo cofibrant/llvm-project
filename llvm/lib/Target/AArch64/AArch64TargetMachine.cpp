@@ -229,6 +229,12 @@ static cl::opt<bool> EnableSRLTSubregToRegMitigation(
              "super-regs when using Subreg Liveness Tracking"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> EnableLiveRangeReduction(
+    "aarch64-enable-live-range-reduction",
+    cl::desc(
+        "Enable the live range reduction mutation in the machine scheduler"),
+    cl::init(false), cl::Hidden);
+
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void
 LLVMInitializeAArch64Target() {
   // Register the target.
@@ -509,6 +515,8 @@ AArch64TargetMachine::createMachineScheduler(MachineSchedContext *C) const {
   ScheduleDAGMILive *DAG = createSchedLive(C);
   DAG->addMutation(createLoadClusterDAGMutation(DAG->TII, DAG->TRI));
   DAG->addMutation(createStoreClusterDAGMutation(DAG->TII, DAG->TRI));
+  if (EnableLiveRangeReduction)
+    DAG->addMutation(createLiveRangeReductionMutation(DAG->TII, DAG->TRI));
   if (ST.hasFusion())
     DAG->addMutation(createAArch64MacroFusionDAGMutation());
   return DAG;
