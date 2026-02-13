@@ -2473,9 +2473,34 @@ void CopyConstrain::apply(ScheduleDAGInstrs *DAGInstrs) {
 //==-----------------------------------------------------------------------===//
 
 namespace {
+
+using ClashMap = DenseMap<const SUnit *, SmallPtrSet<SUnit *, 4>>;
+
 class LiveRangeReductionMutation : public ScheduleDAGMutation {
-  const TargetInstrInfo *TII;
-  const TargetRegisterInfo *TRI;
+  struct SUnitCompare {
+    const LiveRangeReductionMutation *Mutation = nullptr;
+
+    bool operator()(const SUnit *A, const SUnit *B) const {
+      unsigned PA = Mutation->CachedPriority.lookup(A);
+      unsigned PB = Mutation->CachedPriority.lookup(B);
+      if (PA != PB)
+        return PA > PB;
+      return A < B;
+    }
+  };
+
+  friend struct SUnitCompare;
+
+  [[maybe_unused]] const TargetInstrInfo *TII;
+  [[maybe_unused]] const TargetRegisterInfo *TRI;
+
+  ClashMap MustClash;
+  ClashMap MayClash;
+
+  DenseMap<const SUnit *, unsigned> CachedPriority;
+  // Invariant: all SUnits in PQ have non-zero priority--i.e.,
+  // `CachedPriority[SU] != 0`.
+  std::set<SUnit *, SUnitCompare> PQ;
 
 public:
   LiveRangeReductionMutation(const TargetInstrInfo *TII,
@@ -2483,6 +2508,29 @@ public:
       : TII(TII), TRI(TRI) {}
 
   void apply(ScheduleDAGInstrs *DAGInstrs) override;
+
+private:
+  void initClashMaps(ScheduleDAGInstrs *DAGInstrs);
+  void initPriorityQueue(ScheduleDAGInstrs *DAGInstrs);
+  unsigned computePriority(const SUnit *SU) const;
+  void dumpAnalysis();
+
+  void updatePriority(SUnit *SU) {
+    if (!PQ.erase(SU))
+      return;
+    unsigned Priority = computePriority(SU);
+    if (Priority) {
+      CachedPriority[SU] = Priority;
+      PQ.insert(SU);
+    }
+  }
+
+  SUnit *popMax() {
+    auto It = PQ.begin();
+    SUnit *Top = *It;
+    PQ.erase(It);
+    return Top;
+  }
 };
 } // end anonymous namespace
 
@@ -2492,9 +2540,327 @@ llvm::createLiveRangeReductionMutation(const TargetInstrInfo *TII,
   return std::make_unique<LiveRangeReductionMutation>(TII, TRI);
 }
 
+template <typename Fn>
+static void forEachDefdPSet(const SUnit *SU, const MachineRegisterInfo &MRI,
+                            Fn F) {
+  for (const MachineOperand &MO : SU->getInstr()->defs()) {
+    Register Reg = MO.getReg();
+    // TODO(@cofibrant) handle physical registers.
+    if (!Reg.isVirtual())
+      continue;
+
+    for (PSetIterator PSetI = MRI.getPressureSets(VirtRegOrUnit(Reg));
+         PSetI.isValid(); ++PSetI)
+      if (F(*PSetI))
+        return;
+  }
+}
+
+template <unsigned SmallSize>
+static void collectDefdPSets(const SUnit *SU, const MachineRegisterInfo &MRI,
+                             SmallSet<unsigned, SmallSize> &DefdPSets) {
+  forEachDefdPSet(SU, MRI, [&](unsigned PSet) {
+    DefdPSets.insert(PSet);
+    return false;
+  });
+}
+
 void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
   LLVM_DEBUG(dbgs() << "*** Begin live range reduction mutation ***\n");
+
+  MustClash.clear();
+  MayClash.clear();
+  PQ.clear();
+
+  initClashMaps(DAGInstrs);
+  initPriorityQueue(DAGInstrs);
+
+  const MachineRegisterInfo &MRI = DAGInstrs->MF.getRegInfo();
+  SmallVector<SUnit *, 32> DirtyNodes;
+  ClashMap InvalidationCandidates;
+
+  while (!PQ.empty()) {
+    DirtyNodes.clear();
+    SUnit *SU = popMax();
+
+    LLVM_DEBUG(dbgs() << "Processing SU(" << SU->NodeNum << ")\n");
+
+    auto It = MustClash.find(SU);
+    if (It == MustClash.end()) {
+      LLVM_DEBUG(dbgs() << "  No MustClash entries, skipping\n");
+      continue;
+    }
+
+    SmallPtrSet<SUnit *, 4> &MustSet = It->second;
+    LLVM_DEBUG(dbgs() << "  MustSet size: " << MustSet.size() << "\n");
+
+    SUnit *Cand = nullptr;
+    unsigned MaxDelta = 0;
+
+    // Iterate over the must set to find a candidate.
+    for (SUnit *MustClashSU : MustSet) {
+      // Skip any candidates for which an edge would introduce a cycle.
+      if (!DAGInstrs->canAddEdge(SU, MustClashSU)) {
+        LLVM_DEBUG(dbgs() << "  Candidate SU(" << MustClashSU->NodeNum
+                          << "): canAddEdge=false, skipping\n");
+        continue;
+      }
+
+      LLVM_DEBUG(dbgs() << "  Candidate SU(" << MustClashSU->NodeNum
+                        << "): canAddEdge=true\n");
+
+      unsigned Delta = 1; // TODO: compute / estimate impact of new edge
+      if (Delta > MaxDelta) {
+        MaxDelta = Delta;
+        Cand = MustClashSU;
+      }
+    }
+
+    // Didn't find a candidate, so node is already maximally constrained.
+    if (!Cand) {
+      LLVM_DEBUG(dbgs() << "  No valid candidate found\n");
+      continue;
+    }
+
+    LLVM_DEBUG(dbgs() << "Adding an edge: " << Cand << " -> " << SU
+                      << " (PQ: " << PQ.size() << ")\n");
+
+    // Update Cand's must set. We assume the new edge will interfere with every
+    // pressure set that Cand's defs do.
+    SmallSet<unsigned, 4> DefdPSets;
+    collectDefdPSets(Cand, MRI, DefdPSets);
+    InvalidationCandidates.clear();
+
+    // Look for predecessors of SU which Cand must clash with.
+    for (const SDep &Pred : SU->Preds) {
+      SUnit *ClashSU = Pred.getSUnit();
+      if (ClashSU == Cand || Pred.getKind() != SDep::Data ||
+          !ClashSU->isInstr())
+        continue;
+
+      forEachDefdPSet(ClashSU, MRI, [&](unsigned PSet) {
+        if (!DefdPSets.contains(PSet))
+          return false;
+
+        // Update both must sets to maintain symmetry.
+        MustClash[Cand].insert(ClashSU);
+        if (MustClash[ClashSU].insert(Cand).second)
+          DirtyNodes.push_back(ClashSU);
+        return true;
+      });
+    }
+
+    // Look for SUnits whose may sets might need updating after the new edge is
+    // added.
+    for (SUnit *MaybeDirty : PQ) {
+      bool ReachesCand = DAGInstrs->IsReachable(Cand, MaybeDirty);
+
+      for (SUnit *MayClash : MayClash[MaybeDirty]) {
+        if (MustClash[MaybeDirty].contains(MayClash))
+          continue;
+
+        bool SUReachesMayClash = DAGInstrs->IsReachable(MayClash, SU);
+
+        if (ReachesCand && SUReachesMayClash) {
+          InvalidationCandidates[MaybeDirty].insert(MayClash);
+          continue;
+        }
+
+        // If for each successor of MayClash, the successor already reaches
+        // MaybeDirty or, given SUReachesMayClash, already reaches SU, then mark
+        // as an invalidation candidate.
+        bool CanInvalidate = true;
+        for (const SDep &Succ : MayClash->Succs) {
+          SUnit *SuccSU = Succ.getSUnit();
+
+          if (SuccSU->isBoundaryNode() || Succ.getKind() != SDep::Data)
+            continue;
+
+          if (!(DAGInstrs->IsReachable(MaybeDirty, SuccSU) ||
+                (SUReachesMayClash && DAGInstrs->IsReachable(SU, SuccSU)))) {
+            CanInvalidate = false;
+            break;
+          }
+        }
+
+        if (CanInvalidate) {
+          InvalidationCandidates[MaybeDirty].insert(MayClash);
+          LLVM_DEBUG(dbgs() << "  Found invalidation candidate: MayClash SU("
+                            << MaybeDirty->NodeNum << ") <-> SU("
+                            << MayClash->NodeNum << ")\n");
+        }
+      }
+    }
+
+    // For each SUnit with invalidation candidates, check whether the
+    // invalidation candidates agree that we no longer may clash. If so, remove
+    // from the may sets and mark as dirty.
+    for (auto &[A, Candidates] : InvalidationCandidates) {
+      bool Dirty = false;
+      for (SUnit *B : Candidates) {
+        auto BIt = InvalidationCandidates.find(B);
+        if (BIt == InvalidationCandidates.end() || !BIt->second.contains(A))
+          continue;
+        // We'll erase A from B's set on B's iteration.
+        MayClash[A].erase(B);
+        Dirty = true;
+      }
+
+      if (Dirty)
+        DirtyNodes.push_back(const_cast<SUnit *>(A));
+    }
+
+    DirtyNodes.push_back(Cand);
+    for (SUnit *Dirty : DirtyNodes)
+      updatePriority(Dirty);
+
+    // Insert the artificial edge.
+    DAGInstrs->addEdge(SU, SDep(Cand, SDep::Artificial));
+  }
+
   LLVM_DEBUG(dbgs() << "*** End live range reduction mutation ***\n");
+}
+
+void LiveRangeReductionMutation::initClashMaps(ScheduleDAGInstrs *DAGInstrs) {
+  LLVM_DEBUG(dbgs() << "initClashMaps: " << DAGInstrs->SUnits.size()
+                    << " SUnits\n");
+
+  const MachineRegisterInfo &MRI = DAGInstrs->MF.getRegInfo();
+  SmallSet<unsigned, 4> DefdPSets;
+
+  // Initialise MustClash and MayClash
+  for (SUnit &SU : DAGInstrs->SUnits) {
+    if (!SU.isInstr())
+      continue;
+
+    DefdPSets.clear();
+    collectDefdPSets(&SU, MRI, DefdPSets);
+
+    LLVM_DEBUG(dbgs() << "Processing SU(" << SU.NodeNum << ")\n";
+               SU.getInstr()->dump(); dbgs() << "DefdPSets:";
+               for (unsigned PS : DefdPSets) dbgs() << " " << PS;
+               dbgs() << "\n";);
+    // MustClash
+    //
+    // For now, we say two SUnits must clash if they have a common user and
+    // occupying a common pressure set.
+    for (const SDep &Succ : SU.Succs) {
+      // Only consider data dependencies
+      if (Succ.getKind() != SDep::Data)
+        continue;
+
+      // Look for predecessors of these successors.
+      for (const SDep &Pred : Succ.getSUnit()->Preds) {
+        SUnit *ClashSU = Pred.getSUnit();
+        if (&SU == ClashSU || Pred.getKind() != SDep::Data ||
+            !ClashSU->isInstr())
+          continue;
+
+        // Check for common pressure sets:
+        forEachDefdPSet(ClashSU, MRI, [&](unsigned PSet) {
+          if (!DefdPSets.contains(PSet))
+            return false;
+          MustClash[&SU].insert(ClashSU);
+          LLVM_DEBUG(dbgs() << "  MustClash: SU(" << SU.NodeNum << ") -> SU("
+                            << Succ.getSUnit()->NodeNum << ") <- SU("
+                            << ClashSU->NodeNum << ") [PSet " << PSet << "]\n");
+          return true;
+        });
+      }
+    }
+
+    // MayClash
+    //
+    // Two SUnits may clash if the live range of either may intersect that of
+    // the other. At the moment, we have an expensive iteration that initialises
+    // this, but this wants fixing in a real implementation.
+    for (SUnit &ClashSU : DAGInstrs->SUnits) {
+      if (&SU == &ClashSU || !ClashSU.isInstr() ||
+          DAGInstrs->IsReachable(&ClashSU, &SU))
+        continue;
+
+      for (const SDep &Succ : ClashSU.Succs) {
+        SUnit *SuccSU = Succ.getSUnit();
+        if (SuccSU == &SU || SuccSU->isBoundaryNode() ||
+            Succ.getKind() != SDep::Data || DAGInstrs->IsReachable(&SU, SuccSU))
+          continue;
+
+        bool Found = false;
+        // Check for common pressure sets:
+        forEachDefdPSet(&ClashSU, MRI, [&](unsigned PSet) {
+          if (!DefdPSets.contains(PSet))
+            return false;
+          // This check is not symmetrical so add in both directions.
+          MayClash[&SU].insert(&ClashSU);
+          MayClash[&ClashSU].insert(&SU);
+
+          LLVM_DEBUG(dbgs() << "  MayClash: SU(" << SU.NodeNum << ") <-> SU("
+                            << ClashSU.NodeNum << ") [PSet " << PSet << "]\n");
+          Found = true;
+          return true;
+        });
+
+        if (Found)
+          break;
+      }
+    }
+  }
+
+  LLVM_DEBUG(dumpAnalysis());
+}
+
+void LiveRangeReductionMutation::initPriorityQueue(
+    ScheduleDAGInstrs *DAGInstrs) {
+  LLVM_DEBUG(dbgs() << "initPriorityQueue: " << DAGInstrs->SUnits.size()
+                    << " SUnits\n");
+
+  CachedPriority.clear();
+  for (SUnit &SU : DAGInstrs->SUnits)
+    CachedPriority[&SU] = computePriority(&SU);
+
+  LLVM_DEBUG(for (SUnit &SU : DAGInstrs->SUnits) {
+    unsigned P = CachedPriority[&SU];
+    if (P)
+      dbgs() << "  SU(" << SU.NodeNum << ") priority=" << P << "\n";
+  });
+
+  PQ = std::set<SUnit *, SUnitCompare>(SUnitCompare{this});
+  for (SUnit &SU : DAGInstrs->SUnits) {
+    if (CachedPriority[&SU])
+      PQ.insert(&SU);
+  }
+
+  LLVM_DEBUG(dbgs() << "PQ size: " << PQ.size() << "\n");
+}
+
+unsigned LiveRangeReductionMutation::computePriority(const SUnit *SU) const {
+  // For now, naively compute the difference between the size of the may sets
+  // and the must sets. This tries to capture an overestimate of the best
+  // improvement in live range we can expect.
+  unsigned MaySize = 0;
+  unsigned MustSize = 0;
+
+  if (auto It = MayClash.find(SU); It != MayClash.end())
+    MaySize = It->second.size();
+
+  if (auto It = MustClash.find(SU); It != MustClash.end())
+    MustSize = It->second.size();
+
+  assert(MaySize >= MustSize && "Must set larger than may set?!");
+  return MaySize - MustSize;
+}
+
+void LiveRangeReductionMutation::dumpAnalysis() {
+  dbgs() << "Clash analysis dump:\n";
+  for (const SUnit *SU : MayClash.keys()) {
+    dbgs() << "SU(" << SU->NodeNum << ")\n  MustClash: ";
+    for (SUnit *ClashSU : MustClash[SU])
+      dbgs() << "SU(" << ClashSU->NodeNum << ") ";
+    dbgs() << "\n  MayClash: ";
+    for (SUnit *ClashSU : MayClash[SU])
+      dbgs() << "SU(" << ClashSU->NodeNum << ") ";
+    dbgs() << "\n";
+  }
 }
 
 //===----------------------------------------------------------------------===//
