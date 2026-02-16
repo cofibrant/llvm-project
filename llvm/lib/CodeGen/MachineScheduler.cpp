@@ -2495,6 +2495,7 @@ class LiveRangeReductionMutation : public ScheduleDAGMutation {
   [[maybe_unused]] const TargetRegisterInfo *TRI;
 
   ClashMap MustClash;
+  ClashMap MaySpan;
   ClashMap MayClash;
 
   DenseMap<const SUnit *, unsigned> CachedPriority;
@@ -2569,6 +2570,7 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
   LLVM_DEBUG(dbgs() << "*** Begin live range reduction mutation ***\n");
 
   MustClash.clear();
+  MaySpan.clear();
   MayClash.clear();
   PQ.clear();
 
@@ -2609,7 +2611,15 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
       LLVM_DEBUG(dbgs() << "  Candidate SU(" << MustClashSU->NodeNum
                         << "): canAddEdge=true\n");
 
-      unsigned Delta = 1; // TODO: compute / estimate impact of new edge
+      // For now, naively score based on the number of predecessors of
+      // MustClashSU that SU may clash with.
+      unsigned Delta = 0;
+      for (SDep &Pred : MustClashSU->Preds) {
+        if (MayClash[SU].contains(Pred.getSUnit()) &&
+            !MustClash[SU].contains(Pred.getSUnit()))
+          Delta += 1;
+      }
+
       if (Delta > MaxDelta) {
         MaxDelta = Delta;
         Cand = MustClashSU;
@@ -2622,8 +2632,8 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
       continue;
     }
 
-    LLVM_DEBUG(dbgs() << "Adding an edge: " << Cand << " -> " << SU
-                      << " (PQ: " << PQ.size() << ")\n");
+    LLVM_DEBUG(dbgs() << "Adding an edge: SU(" << Cand->NodeNum << ") -> SU("
+                      << SU->NodeNum << ") (PQ size: " << PQ.size() << ")\n");
 
     // Update Cand's must set. We assume the new edge will interfere with every
     // pressure set that Cand's defs do.
@@ -2632,6 +2642,7 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
     InvalidationCandidates.clear();
 
     // Look for predecessors of SU which Cand must clash with.
+    LLVM_DEBUG(dbgs() << "  Updating MustClash sets\n");
     for (const SDep &Pred : SU->Preds) {
       SUnit *ClashSU = Pred.getSUnit();
       if (ClashSU == Cand || Pred.getKind() != SDep::Data ||
@@ -2652,10 +2663,11 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
 
     // Look for SUnits whose may sets might need updating after the new edge is
     // added.
+    LLVM_DEBUG(dbgs() << "  Updating MayClash sets\n");
     for (SUnit *MaybeDirty : PQ) {
       bool ReachesCand = DAGInstrs->IsReachable(Cand, MaybeDirty);
 
-      for (SUnit *MayClash : MayClash[MaybeDirty]) {
+      for (SUnit *MayClash : MaySpan[MaybeDirty]) {
         if (MustClash[MaybeDirty].contains(MayClash))
           continue;
 
@@ -2663,6 +2675,9 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
 
         if (ReachesCand && SUReachesMayClash) {
           InvalidationCandidates[MaybeDirty].insert(MayClash);
+          LLVM_DEBUG(dbgs() << "  Found invalidation candidate: MayClash SU("
+                            << MaybeDirty->NodeNum << ") <-> SU("
+                            << MayClash->NodeNum << ")\n");
           continue;
         }
 
@@ -2698,6 +2713,7 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
     for (auto &[A, Candidates] : InvalidationCandidates) {
       bool Dirty = false;
       for (SUnit *B : Candidates) {
+        MaySpan[A].erase(B);
         auto BIt = InvalidationCandidates.find(B);
         if (BIt == InvalidationCandidates.end() || !BIt->second.contains(A))
           continue;
@@ -2793,6 +2809,8 @@ void LiveRangeReductionMutation::initClashMaps(ScheduleDAGInstrs *DAGInstrs) {
           // This check is not symmetrical so add in both directions.
           MayClash[&SU].insert(&ClashSU);
           MayClash[&ClashSU].insert(&SU);
+          // Cache that ClashSU may span SU.
+          MaySpan[&SU].insert(&ClashSU);
 
           LLVM_DEBUG(dbgs() << "  MayClash: SU(" << SU.NodeNum << ") <-> SU("
                             << ClashSU.NodeNum << ") [PSet " << PSet << "]\n");
