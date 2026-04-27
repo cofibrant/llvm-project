@@ -2475,6 +2475,7 @@ void CopyConstrain::apply(ScheduleDAGInstrs *DAGInstrs) {
 namespace {
 
 using ClashMap = DenseMap<const SUnit *, SmallPtrSet<SUnit *, 4>>;
+using RangeBound = DenseMap<const SUnit *, unsigned>;
 
 class LiveRangeReductionMutation : public ScheduleDAGMutation {
   struct SUnitCompare {
@@ -2494,8 +2495,8 @@ class LiveRangeReductionMutation : public ScheduleDAGMutation {
   [[maybe_unused]] const TargetInstrInfo *TII;
   [[maybe_unused]] const TargetRegisterInfo *TRI;
 
-  ClashMap MustClash;
-  ClashMap MayClash;
+  ClashMap MustClash, MayClash;
+  RangeBound MinDef, MaxDef, MinKill, MaxKill;
 
   DenseMap<const SUnit *, unsigned> CachedPriority;
   // Invariant: all SUnits in PQ have non-zero priority--i.e.,
@@ -2510,6 +2511,7 @@ public:
   void apply(ScheduleDAGInstrs *DAGInstrs) override;
 
 private:
+  void initRangeBounds(ScheduleDAGInstrs *DAGInstrs);
   void initClashMaps(ScheduleDAGInstrs *DAGInstrs);
   void initPriorityQueue(ScheduleDAGInstrs *DAGInstrs);
   unsigned computePriority(const SUnit *SU) const;
@@ -2571,10 +2573,15 @@ static void collectDefdPSets(const SUnit *SU, const MachineRegisterInfo &MRI,
 void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
   LLVM_DEBUG(dbgs() << "*** Begin live range reduction mutation ***\n");
 
+  MinDef.clear();
+  MaxDef.clear();
+  MinKill.clear();
+  MaxKill.clear();
   MustClash.clear();
   MayClash.clear();
   PQ.clear();
 
+  initRangeBounds(DAGInstrs);
   initClashMaps(DAGInstrs);
   initPriorityQueue(DAGInstrs);
 
@@ -2616,6 +2623,46 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
   }
 
   LLVM_DEBUG(dbgs() << "*** End live range reduction mutation ***\n");
+}
+
+void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
+  LLVM_DEBUG(dbgs() << "initRangeBounds: " << DAGInstrs->SUnits.size()
+                    << " SUnits\n");
+  for (SUnit &SU : DAGInstrs->SUnits) {
+    unsigned MaxMinDef = 0;
+    for (SDep &Pred : SU.Preds) {
+      // Skip non-data dependencies
+      if (Pred.getKind() != SDep::Data)
+        continue;
+
+      SUnit *PredSU = Pred.getSUnit();
+      assert(MinDef.contains(PredSU) && "SUnits should be visited in topological order");
+      MaxMinDef = std::max(MaxMinDef, MinDef[PredSU] + 1);
+    }
+
+    MinDef[&SU] = MaxMinDef;
+  }
+
+  for (SUnit &SU : llvm::reverse(DAGInstrs->SUnits)) {
+    unsigned MinMaxDef = DAGInstrs->SUnits.size() - 1;
+    unsigned MaxMaxDef = 0;
+    unsigned MaxMinDef = MinDef[&SU];
+    for (SDep &Succ : SU.Succs) {
+      // Skip non-data dependencies
+      if (Succ.getKind() != SDep::Data)
+        continue;
+
+      SUnit *SuccSU = Succ.getSUnit();
+      assert(MaxDef.contains(SuccSU) && "SUnits should be visited in reverse topological order");
+      MinMaxDef = std::min(MinMaxDef, MaxDef[SuccSU] - 1);
+      MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
+      MaxMinDef = std::max(MaxMinDef, MinDef[SuccSU]);
+    }
+
+    MaxDef[&SU] = MinMaxDef;
+    MinKill[&SU] = MaxMinDef;
+    MaxKill[&SU] = std::max(MaxMinDef, MaxMaxDef);
+  }
 }
 
 void LiveRangeReductionMutation::initClashMaps(ScheduleDAGInstrs *DAGInstrs) {
@@ -2734,7 +2781,7 @@ unsigned
 LiveRangeReductionMutation::selectionHeuristic(const SUnit *SU,
                                                const SUnit *Candidate) {
   // For now, naively score based on the number of predecessors of
-  // MustClashSU that SU may clash with.
+  // Candidate that SU may clash with.
   unsigned Score = 0;
   for (const SDep &Pred : Candidate->Preds) {
     if (MayClash[SU].contains(Pred.getSUnit()) &&
