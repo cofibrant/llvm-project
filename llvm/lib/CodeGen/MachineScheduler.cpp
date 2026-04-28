@@ -2474,8 +2474,8 @@ void CopyConstrain::apply(ScheduleDAGInstrs *DAGInstrs) {
 
 namespace {
 
-using ClashMap = DenseMap<const SUnit *, SmallPtrSet<SUnit *, 4>>;
-using RangeBound = DenseMap<const SUnit *, unsigned>;
+using ClashMap = DenseMap<SUnit *, SmallPtrSet<SUnit *, 4>>;
+using RangeBound = DenseMap<SUnit *, unsigned>;
 
 class LiveRangeReductionMutation : public ScheduleDAGMutation {
   struct SUnitCompare {
@@ -2498,7 +2498,7 @@ class LiveRangeReductionMutation : public ScheduleDAGMutation {
   ClashMap MustClash, MayClash;
   RangeBound MinDef, MaxDef, MinKill, MaxKill;
 
-  DenseMap<const SUnit *, unsigned> CachedPriority;
+  DenseMap<SUnit *, unsigned> CachedPriority;
   // Invariant: all SUnits in PQ have non-zero priority--i.e.,
   // `CachedPriority[SU] != 0`.
   std::set<SUnit *, SUnitCompare> PQ;
@@ -2515,9 +2515,13 @@ private:
   void initClashMaps(ScheduleDAGInstrs *DAGInstrs);
   void initPriorityQueue(ScheduleDAGInstrs *DAGInstrs);
   unsigned computePriority(const SUnit *SU) const;
+  void incrementalUpdate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
+                         SUnit *Candidate);
+  bool mayClash(SUnit *A, SUnit *B);
+  bool mustClash(SUnit *A, SUnit *B);
   SUnit *selectCandidate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
-                         const SmallPtrSet<SUnit *, 4> &Candidates);
-  unsigned selectionHeuristic(const SUnit *SU, const SUnit *Candidate);
+                         SmallPtrSet<SUnit *, 4> &Candidates);
+  unsigned selectionHeuristic(SUnit *SU, SUnit *Candidate);
   void dumpAnalysis();
 
   void updatePriority(SUnit *SU) {
@@ -2610,13 +2614,8 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
                       << ") -> SU(" << SU->NodeNum
                       << ") (PQ size: " << PQ.size() << ")\n");
 
-    // TODO(@cofibrant) update MayClash sets
-    LLVM_DEBUG(dbgs() << "  Updating MustClash sets\n");
-
-    // TODO(@cofibrant) update MayClash sets
-    LLVM_DEBUG(dbgs() << "  Updating MayClash sets\n");
-
-    // TODO(@cofibrant) clean up priority queue
+    // Update the analysis and priority queue based on the new edge
+    incrementalUpdate(DAGInstrs, SU, Candidate);
 
     // Insert the artificial edge.
     DAGInstrs->addEdge(SU, SDep(Candidate, SDep::Artificial));
@@ -2630,13 +2629,14 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
                     << " SUnits\n");
   for (SUnit &SU : DAGInstrs->SUnits) {
     unsigned MaxMinDef = 0;
-    for (SDep &Pred : SU.Preds) {
-      // Skip non-data dependencies
-      if (Pred.getKind() != SDep::Data)
+    for (const SDep &Pred : SU.Preds) {
+      // Skip weak and anti-dependencies
+      if (Pred.getKind() == SDep::Anti || Pred.isWeak())
         continue;
 
       SUnit *PredSU = Pred.getSUnit();
-      assert(MinDef.contains(PredSU) && "SUnits should be visited in topological order");
+      assert(MinDef.contains(PredSU) &&
+             "SUnits should be visited in topological order");
       MaxMinDef = std::max(MaxMinDef, MinDef[PredSU] + 1);
     }
 
@@ -2647,14 +2647,20 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
     unsigned MinMaxDef = DAGInstrs->SUnits.size() - 1;
     unsigned MaxMaxDef = 0;
     unsigned MaxMinDef = MinDef[&SU];
-    for (SDep &Succ : SU.Succs) {
-      // Skip non-data dependencies
-      if (Succ.getKind() != SDep::Data)
+    for (const SDep &Succ : SU.Succs) {
+      // Skip weak and anti-dependencies
+      if (Succ.getKind() == SDep::Anti || Succ.isWeak())
         continue;
 
       SUnit *SuccSU = Succ.getSUnit();
-      assert(MaxDef.contains(SuccSU) && "SUnits should be visited in reverse topological order");
+      assert(MaxDef.contains(SuccSU) &&
+             "SUnits should be visited in reverse topological order");
       MinMaxDef = std::min(MinMaxDef, MaxDef[SuccSU] - 1);
+
+      // Only artificial or data successors contribute to kill
+      if (!Succ.isArtificial() && Succ.getKind() != SDep::Data)
+        continue;
+
       MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
       MaxMinDef = std::max(MaxMinDef, MinDef[SuccSU]);
     }
@@ -2689,17 +2695,30 @@ void LiveRangeReductionMutation::initClashMaps(ScheduleDAGInstrs *DAGInstrs) {
       // Analysis is symmetrical
       if (Other.NodeNum >= SU.NodeNum)
         continue;
-      // MustClash
-      //
-      // Two SUnits may clash if their minimum live ranges intersect and they
-      // def a common pressure set.
-      // TODO(@cofibrant) initialise MustClash sets
 
-      // MayClash
-      //
-      // Two SUnits may clash if their minimum live ranges intersect and they
-      // def a common pressure set.
-      // TODO(@cofibrant) initialise MayClash sets
+      // If two SUnits may not clash, it is impossible that they must clash so
+      // abort
+      if (!mayClash(&SU, &Other))
+        continue;
+
+      // Check that SU and Other def a common PSet
+      bool DefCommonPSet = false;
+      forEachDefdPSet(&Other, MRI, [&](unsigned PSet) {
+        DefCommonPSet |= DefdPSets.contains(PSet);
+        return DefCommonPSet;
+      });
+
+      if (!DefCommonPSet)
+        continue;
+
+      MayClash[&SU].insert(&Other);
+      MayClash[&Other].insert(&SU);
+
+      if (!mustClash(&SU, &Other))
+        continue;
+
+      MustClash[&SU].insert(&Other);
+      MustClash[&Other].insert(&SU);
     }
   }
 
@@ -2747,11 +2766,167 @@ unsigned LiveRangeReductionMutation::computePriority(const SUnit *SU) const {
   return MaySize - MustSize;
 }
 
+void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
+                                                   SUnit *Target,
+                                                   SUnit *Source) {
+  SmallPtrSet<SUnit *, 16> DefDirty, KillDirty, PQDirty;
+
+  // Forward propagate MinDef
+  if (MinDef[Source] + 1 > MinDef[Target]) {
+    SmallVector<SUnit *, 16> FwdQ;
+    FwdQ.push_back(Target);
+
+    for (unsigned I = 0; I < FwdQ.size(); ++I) {
+      SUnit *SU = FwdQ[I];
+
+      // FIXME(@cofibrant) this is duplicated from `initRangeBounds()`
+      unsigned MaxMinDef = 0;
+      for (const SDep &Pred : SU->Preds) {
+        // Skip weak and anti-dependencies
+        if (Pred.getKind() == SDep::Anti || Pred.isWeak())
+          continue;
+
+        SUnit *PredSU = Pred.getSUnit();
+        MaxMinDef = std::max(MaxMinDef, MinDef[PredSU] + 1);
+      }
+
+      if (MinDef[SU] == MaxMinDef)
+        continue;
+
+      MinDef[SU] = MaxMinDef;
+      DefDirty.insert(SU);
+
+      for (const SDep &Succ : SU->Succs) {
+        // Skip weak and anti-dependencies
+        if (Succ.getKind() == SDep::Anti || Succ.isWeak())
+          continue;
+
+        FwdQ.push_back(Succ.getSUnit());
+      }
+    }
+  }
+
+  // Backward propagate MaxDef
+  if (MaxDef[Target] - 1 < MaxDef[Source]) {
+    SmallVector<SUnit *, 16> BwdQ;
+    BwdQ.push_back(Source);
+
+    for (unsigned I = 0; I < BwdQ.size(); ++I) {
+      SUnit *SU = BwdQ[I];
+
+      // FIXME(@cofibrant) this is duplicated from `initRangeBounds()`
+      unsigned MinMaxDef = DAGInstrs->SUnits.size() - 1;
+      for (const SDep &Succ : SU->Succs) {
+        // Skip weak and anti-dependencies
+        if (Succ.getKind() == SDep::Anti || Succ.isWeak())
+          continue;
+
+        SUnit *SuccSU = Succ.getSUnit();
+        MinMaxDef = std::min(MinMaxDef, MaxDef[SuccSU] - 1);
+      }
+
+      if (MaxDef[SU] == MinMaxDef)
+        continue;
+
+      MaxDef[SU] = MinMaxDef;
+      DefDirty.insert(SU);
+
+      for (const SDep &Pred : SU->Preds) {
+        // Skip weak and anti-dependencies
+        if (Pred.getKind() == SDep::Anti || Pred.isWeak())
+          continue;
+
+        BwdQ.push_back(Pred.getSUnit());
+      }
+    }
+  }
+
+  // Maintain MinKill and MaxKill
+  for (SUnit *Dirty : DefDirty) {
+    auto UpdateMinMaxKill = [&](SUnit *SU) {
+      unsigned MaxMaxDef = 0;
+      unsigned MaxMinDef = MinDef[SU];
+
+      for (const SDep &Succ : SU->Succs) {
+        // Only artificial or data successors contribute to kill
+        if (!Succ.isArtificial() && Succ.getKind() != SDep::Data)
+          continue;
+
+        SUnit *SuccSU = Succ.getSUnit();
+        MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
+        MaxMinDef = std::max(MaxMinDef, MinDef[SuccSU]);
+      }
+
+      unsigned NewMinKill = MaxMinDef;
+      unsigned NewMaxKill = std::max(NewMinKill, MaxMaxDef);
+
+      if (NewMinKill == MinKill[SU] && NewMaxKill == MaxKill[SU])
+        return;
+
+      MinKill[SU] = NewMinKill;
+      MaxKill[SU] = NewMaxKill;
+      KillDirty.insert(SU);
+    };
+
+    UpdateMinMaxKill(Dirty);
+
+    for (const SDep &Pred : Dirty->Preds) {
+      if (!Pred.isArtificial() && Pred.getKind() != SDep::Data)
+        continue;
+      UpdateMinMaxKill(Pred.getSUnit());
+    }
+  }
+
+  // Repair clash maps
+  for (SUnit *Dirty : llvm::concat<SUnit *>(DefDirty, KillDirty)) {
+    // Repair may-clash
+    SmallVector<SUnit *, 4> ToRemove;
+    for (SUnit *Clash : MayClash[Dirty]) {
+      if (mayClash(Dirty, Clash))
+        continue;
+      ToRemove.push_back(Clash);
+    }
+
+    for (SUnit *Clash : ToRemove) {
+      MayClash[Dirty].erase(Clash);
+      MayClash[Clash].erase(Dirty);
+      PQDirty.insert(Clash);
+    }
+
+    // Promote any may-clash pairs that are now must-clash
+    for (SUnit *Clash : MayClash[Dirty]) {
+      if (MustClash[Dirty].contains(Clash))
+        continue;
+
+      if (!mustClash(Dirty, Clash))
+        continue;
+
+      MustClash[Dirty].insert(Clash);
+      MustClash[Clash].insert(Dirty);
+
+      PQDirty.insert(Dirty);
+      PQDirty.insert(Clash);
+    }
+  }
+
+  // Refresh priority queue
+  for (SUnit *Dirty : PQDirty)
+    updatePriority(Dirty);
+}
+
+bool LiveRangeReductionMutation::mayClash(SUnit *A, SUnit *B) {
+  return MaxKill[A] >= MinDef[B] && MaxKill[B] >= MinDef[A];
+}
+
+bool LiveRangeReductionMutation::mustClash(SUnit *A, SUnit *B) {
+  return MinKill[A] >= MaxDef[B] && MinKill[B] >= MaxDef[A];
+}
+
 // Given an SUnit and a set of candidate SUnits, selects a candidate
 // Assumes that each candidate must clash with the given SU.
 SUnit *LiveRangeReductionMutation::selectCandidate(
     ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
-    const SmallPtrSet<SUnit *, 4> &Candidates) {
+    SmallPtrSet<SUnit *, 4> &Candidates) {
   SUnit *Chosen = nullptr;
   unsigned MaxScore = 0;
 
@@ -2767,7 +2942,6 @@ SUnit *LiveRangeReductionMutation::selectCandidate(
                       << "): canAddEdge=true\n");
 
     unsigned Score = selectionHeuristic(SU, Candidate);
-
     if (Score > MaxScore) {
       MaxScore = Score;
       Chosen = Candidate;
@@ -2777,9 +2951,8 @@ SUnit *LiveRangeReductionMutation::selectCandidate(
   return Chosen;
 }
 
-unsigned
-LiveRangeReductionMutation::selectionHeuristic(const SUnit *SU,
-                                               const SUnit *Candidate) {
+unsigned LiveRangeReductionMutation::selectionHeuristic(SUnit *SU,
+                                                        SUnit *Candidate) {
   // For now, naively score based on the number of predecessors of
   // Candidate that SU may clash with.
   unsigned Score = 0;
@@ -2794,7 +2967,7 @@ LiveRangeReductionMutation::selectionHeuristic(const SUnit *SU,
 
 void LiveRangeReductionMutation::dumpAnalysis() {
   dbgs() << "Clash analysis dump:\n";
-  for (const SUnit *SU : MayClash.keys()) {
+  for (SUnit *SU : MayClash.keys()) {
     dbgs() << "SU(" << SU->NodeNum << ")\n  MustClash: ";
     for (SUnit *ClashSU : MustClash[SU])
       dbgs() << "SU(" << ClashSU->NodeNum << ") ";
