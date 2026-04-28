@@ -761,12 +761,11 @@ class TargetRegisterInfo;
     /// Assigns the topological index to the node n.
     void Allocate(int n, int index);
 
+  public:
     /// Fix the ordering, by either recomputing from scratch or by applying
     /// any outstanding updates. Uses a heuristic to estimate what will be
     /// cheaper.
     void FixOrder();
-
-  public:
     LLVM_ABI ScheduleDAGTopologicalSort(std::vector<SUnit> &SUnits,
                                         SUnit *ExitSU);
 

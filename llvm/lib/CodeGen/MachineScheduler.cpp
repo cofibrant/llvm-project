@@ -2497,6 +2497,7 @@ class LiveRangeReductionMutation : public ScheduleDAGMutation {
 
   ClashMap MustClash, MayClash;
   RangeBound MinDef, MaxDef, MinKill, MaxKill;
+  DenseMap<SUnit *, unsigned> NumDataSuccs;
 
   DenseMap<SUnit *, unsigned> CachedPriority;
   // Invariant: all SUnits in PQ have non-zero priority--i.e.,
@@ -2517,12 +2518,18 @@ private:
   unsigned computePriority(const SUnit *SU) const;
   void incrementalUpdate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
                          SUnit *Candidate);
-  bool mayClash(SUnit *A, SUnit *B);
-  bool mustClash(SUnit *A, SUnit *B);
   SUnit *selectCandidate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
                          SmallPtrSet<SUnit *, 4> &Candidates);
   unsigned selectionHeuristic(SUnit *SU, SUnit *Candidate);
   void dumpAnalysis();
+
+  bool mayClash(SUnit *A, SUnit *B) {
+    return MaxKill[A] >= MinDef[B] && MaxKill[B] >= MinDef[A];
+  }
+
+  bool mustClash(SUnit *A, SUnit *B) {
+    return MinKill[A] >= MaxDef[B] && MinKill[B] >= MaxDef[A];
+  }
 
   void updatePriority(SUnit *SU) {
     if (!PQ.erase(SU))
@@ -2627,7 +2634,10 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
 void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
   LLVM_DEBUG(dbgs() << "initRangeBounds: " << DAGInstrs->SUnits.size()
                     << " SUnits\n");
-  for (SUnit &SU : DAGInstrs->SUnits) {
+  for (ScheduleDAGInstrs::topo_iterator
+           It = DAGInstrs->topo_begin(), E = DAGInstrs->topo_end();
+       It != E; ++It) {
+    SUnit &SU = DAGInstrs->SUnits[*It];
     unsigned MaxMinDef = 0;
     for (const SDep &Pred : SU.Preds) {
       // Skip weak and anti-dependencies
@@ -2635,6 +2645,8 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
         continue;
 
       SUnit *PredSU = Pred.getSUnit();
+      if (PredSU->isBoundaryNode())
+        continue;
       assert(MinDef.contains(PredSU) &&
              "SUnits should be visited in topological order");
       MaxMinDef = std::max(MaxMinDef, MinDef[PredSU] + 1);
@@ -2643,16 +2655,22 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
     MinDef[&SU] = MaxMinDef;
   }
 
-  for (SUnit &SU : llvm::reverse(DAGInstrs->SUnits)) {
+  for (ScheduleDAGInstrs::reverse_topo_iterator
+           It = DAGInstrs->topo_rbegin(), E = DAGInstrs->topo_rend();
+       It != E; ++It) {
+    SUnit &SU = DAGInstrs->SUnits[*It];
     unsigned MinMaxDef = DAGInstrs->SUnits.size() - 1;
     unsigned MaxMaxDef = 0;
-    unsigned MaxMinDef = MinDef[&SU];
+    unsigned MaxMinDef = 0;
+    unsigned NumSuccs = 0;
     for (const SDep &Succ : SU.Succs) {
       // Skip weak and anti-dependencies
       if (Succ.getKind() == SDep::Anti || Succ.isWeak())
         continue;
 
       SUnit *SuccSU = Succ.getSUnit();
+      if (SuccSU->isBoundaryNode())
+        continue;
       assert(MaxDef.contains(SuccSU) &&
              "SUnits should be visited in reverse topological order");
       MinMaxDef = std::min(MinMaxDef, MaxDef[SuccSU] - 1);
@@ -2661,13 +2679,18 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
       if (!Succ.isArtificial() && Succ.getKind() != SDep::Data)
         continue;
 
+      ++NumSuccs;
       MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
       MaxMinDef = std::max(MaxMinDef, MinDef[SuccSU]);
     }
 
     MaxDef[&SU] = MinMaxDef;
-    MinKill[&SU] = MaxMinDef;
-    MaxKill[&SU] = std::max(MaxMinDef, MaxMaxDef);
+    NumDataSuccs[&SU] = NumSuccs;
+    MinKill[&SU] = std::max(MaxDef[&SU] + NumDataSuccs[&SU], MaxMinDef);
+    MaxKill[&SU] = std::max(MinKill[&SU], MaxMaxDef);
+    assert(MinDef[&SU] <= MaxDef[&SU] && "Inverted def range");
+    assert(MaxDef[&SU] <= MinKill[&SU] && "Optimistic range not contained");
+    assert(MinKill[&SU] <= MaxKill[&SU] && "Inverted kill range");
   }
 }
 
@@ -2771,6 +2794,9 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
                                                    SUnit *Source) {
   SmallPtrSet<SUnit *, 16> DefDirty, KillDirty, PQDirty;
 
+  ++NumDataSuccs[Source];
+  DefDirty.insert(Source);
+
   // Forward propagate MinDef
   if (MinDef[Source] + 1 > MinDef[Target]) {
     SmallVector<SUnit *, 16> FwdQ;
@@ -2787,6 +2813,8 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
           continue;
 
         SUnit *PredSU = Pred.getSUnit();
+        if (PredSU->isBoundaryNode())
+          continue;
         MaxMinDef = std::max(MaxMinDef, MinDef[PredSU] + 1);
       }
 
@@ -2822,6 +2850,8 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
           continue;
 
         SUnit *SuccSU = Succ.getSUnit();
+        if (SuccSU->isBoundaryNode())
+          continue;
         MinMaxDef = std::min(MinMaxDef, MaxDef[SuccSU] - 1);
       }
 
@@ -2836,6 +2866,9 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
         if (Pred.getKind() == SDep::Anti || Pred.isWeak())
           continue;
 
+        if (Pred.getSUnit()->isBoundaryNode())
+          continue;
+
         BwdQ.push_back(Pred.getSUnit());
       }
     }
@@ -2845,7 +2878,7 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
   for (SUnit *Dirty : DefDirty) {
     auto UpdateMinMaxKill = [&](SUnit *SU) {
       unsigned MaxMaxDef = 0;
-      unsigned MaxMinDef = MinDef[SU];
+      unsigned MaxMinDef = 0;
 
       for (const SDep &Succ : SU->Succs) {
         // Only artificial or data successors contribute to kill
@@ -2853,11 +2886,13 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
           continue;
 
         SUnit *SuccSU = Succ.getSUnit();
+        if (SuccSU->isBoundaryNode())
+          continue;
         MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
         MaxMinDef = std::max(MaxMinDef, MinDef[SuccSU]);
       }
 
-      unsigned NewMinKill = MaxMinDef;
+      unsigned NewMinKill = std::max(MaxDef[SU] + NumDataSuccs[SU], MaxMinDef);
       unsigned NewMaxKill = std::max(NewMinKill, MaxMaxDef);
 
       if (NewMinKill == MinKill[SU] && NewMaxKill == MaxKill[SU])
@@ -2872,6 +2907,8 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
 
     for (const SDep &Pred : Dirty->Preds) {
       if (!Pred.isArtificial() && Pred.getKind() != SDep::Data)
+        continue;
+      if (Pred.getSUnit()->isBoundaryNode())
         continue;
       UpdateMinMaxKill(Pred.getSUnit());
     }
@@ -2912,14 +2949,6 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
   // Refresh priority queue
   for (SUnit *Dirty : PQDirty)
     updatePriority(Dirty);
-}
-
-bool LiveRangeReductionMutation::mayClash(SUnit *A, SUnit *B) {
-  return MaxKill[A] >= MinDef[B] && MaxKill[B] >= MinDef[A];
-}
-
-bool LiveRangeReductionMutation::mustClash(SUnit *A, SUnit *B) {
-  return MinKill[A] >= MaxDef[B] && MinKill[B] >= MaxDef[A];
 }
 
 // Given an SUnit and a set of candidate SUnits, selects a candidate
@@ -2966,16 +2995,23 @@ unsigned LiveRangeReductionMutation::selectionHeuristic(SUnit *SU,
 }
 
 void LiveRangeReductionMutation::dumpAnalysis() {
-  dbgs() << "Clash analysis dump:\n";
-  for (SUnit *SU : MayClash.keys()) {
-    dbgs() << "SU(" << SU->NodeNum << ")\n  MustClash: ";
-    for (SUnit *ClashSU : MustClash[SU])
-      dbgs() << "SU(" << ClashSU->NodeNum << ") ";
-    dbgs() << "\n  MayClash: ";
-    for (SUnit *ClashSU : MayClash[SU])
-      dbgs() << "SU(" << ClashSU->NodeNum << ") ";
-    dbgs() << "\n";
+  dbgs() << "Range analysis dump:\n";
+  for (SUnit *SU : MinDef.keys()) {
+    dbgs() << "SU(" << SU->NodeNum << ")\n"
+           << "  Min range: [" << MaxDef[SU] << "," << MinKill[SU] << ")\n"
+           << "  Max range: [" << MinDef[SU] << "," << MaxKill[SU] << ")\n";
   }
+
+  // dbgs() << "Clash analysis dump:\n";
+  // for (SUnit *SU : MayClash.keys()) {
+  //   dbgs() << "SU(" << SU->NodeNum << ")\n  MustClash: ";
+  //   for (SUnit *ClashSU : MustClash[SU])
+  //     dbgs() << "SU(" << ClashSU->NodeNum << ") ";
+  //   dbgs() << "\n  MayClash: ";
+  //   for (SUnit *ClashSU : MayClash[SU])
+  //     dbgs() << "SU(" << ClashSU->NodeNum << ") ";
+  //   dbgs() << "\n";
+  // }
 }
 
 //===----------------------------------------------------------------------===//

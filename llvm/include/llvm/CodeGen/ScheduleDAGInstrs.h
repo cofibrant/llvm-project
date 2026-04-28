@@ -285,6 +285,14 @@ namespace llvm {
       return Topo.IsReachable(SU, TargetSU);
     }
 
+    using topo_iterator = ScheduleDAGTopologicalSort::iterator;
+    using reverse_topo_iterator = ScheduleDAGTopologicalSort::reverse_iterator;
+
+    topo_iterator topo_begin() { Topo.FixOrder(); return Topo.begin(); }
+    topo_iterator topo_end() { return Topo.end(); }
+    reverse_topo_iterator topo_rbegin() { Topo.FixOrder(); return Topo.rbegin(); }
+    reverse_topo_iterator topo_rend() { return Topo.rend(); }
+
     /// Whether regions with a single MI should be scheduled.
     bool shouldScheduleSingleMIRegions() const {
       return ScheduleSingleMIRegions;
