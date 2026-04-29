@@ -2514,7 +2514,7 @@ private:
   void initRangeBounds(ScheduleDAGInstrs *DAGInstrs);
   void initClashMaps(ScheduleDAGInstrs *DAGInstrs);
   void initPriorityQueue(ScheduleDAGInstrs *DAGInstrs);
-  unsigned computePriority(const SUnit *SU) const;
+  unsigned computePriority(SUnit *SU);
   void incrementalUpdate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
                          SUnit *Candidate);
   SUnit *selectCandidate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
@@ -2784,21 +2784,15 @@ void LiveRangeReductionMutation::initPriorityQueue(
   LLVM_DEBUG(dbgs() << "PQ size: " << PQ.size() << "\n");
 }
 
-unsigned LiveRangeReductionMutation::computePriority(const SUnit *SU) const {
-  // For now, naively compute the difference between the size of the may sets
-  // and the must sets. This tries to capture an overestimate of the best
-  // improvement in live range we can expect.
-  unsigned MaySize = 0;
-  unsigned MustSize = 0;
+unsigned LiveRangeReductionMutation::computePriority(SUnit *SU) {
+  unsigned Delta = 0;
+  for (SUnit *Clash : MayClash[SU]) {
+    if (MustClash[SU].contains(Clash))
+      continue;
+    ++Delta;
+  }
 
-  if (auto It = MayClash.find(SU); It != MayClash.end())
-    MaySize = It->second.size();
-
-  if (auto It = MustClash.find(SU); It != MustClash.end())
-    MustSize = It->second.size();
-
-  assert(MaySize >= MustSize && "Must set larger than may set?!");
-  return MaySize - MustSize;
+  return (MaxKill[SU] - MinDef[SU]) * Delta;
 }
 
 void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
@@ -2994,16 +2988,8 @@ SUnit *LiveRangeReductionMutation::selectCandidate(
 
 unsigned LiveRangeReductionMutation::selectionHeuristic(SUnit *SU,
                                                         SUnit *Candidate) {
-  // For now, naively score based on the number of predecessors of
-  // Candidate that SU may clash with.
-  unsigned Score = 0;
-  for (const SDep &Pred : Candidate->Preds) {
-    if (MayClash[SU].contains(Pred.getSUnit()) &&
-        !MustClash[SU].contains(Pred.getSUnit()))
-      Score += 1;
-  }
-
-  return Score;
+  return std::max(0u, MinDef[Candidate] + 1 - MinDef[SU]) +
+         std::max(0u, MaxDef[SU] - 1 - MaxDef[Candidate]);
 }
 
 void LiveRangeReductionMutation::dumpAnalysis() {
