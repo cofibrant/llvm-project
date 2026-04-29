@@ -2700,7 +2700,7 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
     }
 
     MaxDef[&SU] = MinMaxDef;
-    MaxKill[&SU] = MaxMaxDef;
+    MaxKill[&SU] = std::max(MaxMaxDef, MaxDef[&SU]);
     assert(MinDef[&SU] <= MaxDef[&SU] && "Inverted def range");
     assert(MaxDef[&SU] <= MaxKill[&SU] && "MaxKill should exceed MaxDef");
   }
@@ -2889,7 +2889,7 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
   // Maintain MaxKill
   for (SUnit *Dirty : DefDirty) {
     auto UpdateMinMaxKill = [&](SUnit *SU) {
-      unsigned MaxMaxDef = 0;
+      unsigned MaxMaxDef = MaxDef[SU];
 
       for (const SDep &Succ : SU->Succs) {
         // Only artificial or data successors contribute to kill
