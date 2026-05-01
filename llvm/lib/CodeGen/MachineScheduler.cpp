@@ -2519,7 +2519,7 @@ private:
                          SUnit *Candidate);
   SUnit *selectCandidate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
                          SmallPtrSet<SUnit *, 4> &Candidates);
-  unsigned selectionHeuristic(SUnit *SU, SUnit *Candidate);
+  int selectionHeuristic(SUnit *SU, SUnit *Candidate);
   void dumpAnalysis();
 
   bool mayClash(SUnit *A, SUnit *B) {
@@ -2963,7 +2963,7 @@ SUnit *LiveRangeReductionMutation::selectCandidate(
     ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
     SmallPtrSet<SUnit *, 4> &Candidates) {
   SUnit *Chosen = nullptr;
-  unsigned MaxScore = 0;
+  int MaxScore = 0;
 
   for (SUnit *Candidate : Candidates) {
     // Skip any candidates for which an edge would introduce a cycle.
@@ -2976,7 +2976,7 @@ SUnit *LiveRangeReductionMutation::selectCandidate(
     LLVM_DEBUG(dbgs() << "  Candidate SU(" << Candidate->NodeNum
                       << "): canAddEdge=true\n");
 
-    unsigned Score = selectionHeuristic(SU, Candidate);
+    int Score = selectionHeuristic(SU, Candidate);
     if (Score > MaxScore) {
       MaxScore = Score;
       Chosen = Candidate;
@@ -2986,10 +2986,13 @@ SUnit *LiveRangeReductionMutation::selectCandidate(
   return Chosen;
 }
 
-unsigned LiveRangeReductionMutation::selectionHeuristic(SUnit *SU,
-                                                        SUnit *Candidate) {
-  return std::max(0u, MinDef[Candidate] + 1 - MinDef[SU]) +
-         std::max(0u, MaxDef[SU] - 1 - MaxDef[Candidate]);
+int LiveRangeReductionMutation::selectionHeuristic(SUnit *SU,
+                                                    SUnit *Candidate) {
+  int MinDefDelta = static_cast<int>(MinDef[Candidate]) + 1 -
+                    static_cast<int>(MinDef[SU]);
+  int MaxDefDelta = static_cast<int>(MaxDef[Candidate]) + 1 -
+                    static_cast<int>(MaxDef[SU]);
+  return MinDefDelta + MaxDefDelta;
 }
 
 void LiveRangeReductionMutation::dumpAnalysis() {
