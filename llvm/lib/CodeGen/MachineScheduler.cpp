@@ -2503,6 +2503,8 @@ class LiveRangeReductionMutation : public ScheduleDAGMutation {
   // `CachedPriority[SU] != 0`.
   std::set<SUnit *, SUnitCompare> PQ;
 
+  DenseMap<SUnit *, SmallVector<SUnit *, 4>> CandidatePool;
+
 public:
   LiveRangeReductionMutation(const TargetInstrInfo *TII,
                              const TargetRegisterInfo *TRI)
@@ -2513,12 +2515,12 @@ public:
 private:
   void initRangeBounds(ScheduleDAGInstrs *DAGInstrs);
   void initClashMaps(ScheduleDAGInstrs *DAGInstrs);
+  void initCandidatePools();
   void initPriorityQueue(ScheduleDAGInstrs *DAGInstrs);
   unsigned computePriority(SUnit *SU);
   void incrementalUpdate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
                          SUnit *Candidate);
-  SUnit *selectCandidate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
-                         SmallPtrSet<SUnit *, 4> &Candidates);
+  SUnit *selectCandidateFromPool(ScheduleDAGInstrs *DAGInstrs, SUnit *SU);
   int selectionHeuristic(SUnit *SU, SUnit *Candidate);
   void dumpAnalysis();
 
@@ -2529,8 +2531,7 @@ private:
   bool mustClash(SUnit *A, SUnit *B) {
     // Validate that a data successor of A is a data successor of B
     for (const SDep &Succ : A->Succs) {
-      // Skip weak and anti-dependencies
-      if (Succ.getKind() == SDep::Anti || Succ.isWeak())
+      if (Succ.getKind() != SDep::Data)
         continue;
 
       SUnit *SuccSU = Succ.getSUnit();
@@ -2538,8 +2539,7 @@ private:
         continue;
 
       for (const SDep &Pred : SuccSU->Preds) {
-        // Skip weak and anti-dependencies
-        if (Pred.getKind() == SDep::Anti || Pred.isWeak())
+        if (Pred.getKind() != SDep::Data)
           continue;
 
         if (Pred.getSUnit() == B)
@@ -2554,7 +2554,7 @@ private:
     if (!PQ.erase(SU))
       return;
     unsigned Priority = computePriority(SU);
-    if (Priority) {
+    if (Priority && !CandidatePool[SU].empty()) {
       CachedPriority[SU] = Priority;
       PQ.insert(SU);
     }
@@ -2608,29 +2608,23 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
   MaxKill.clear();
   MustClash.clear();
   MayClash.clear();
+  CandidatePool.clear();
   PQ.clear();
 
   initRangeBounds(DAGInstrs);
   initClashMaps(DAGInstrs);
+  initCandidatePools();
   initPriorityQueue(DAGInstrs);
 
   while (!PQ.empty()) {
     SUnit *SU = popMax();
 
-    LLVM_DEBUG(dbgs() << "Processing SU(" << SU->NodeNum << ")\n");
+    LLVM_DEBUG(dbgs() << "Processing SU(" << SU->NodeNum << ") priority="
+                      << CachedPriority[SU] << " with "
+                      << CandidatePool[SU].size() << " candidates\n");
 
-    auto It = MustClash.find(SU);
-    if (It == MustClash.end()) {
-      LLVM_DEBUG(dbgs() << "  No MustClash entries, skipping\n");
-      continue;
-    }
-
-    SmallPtrSet<SUnit *, 4> &MustSet = It->second;
-    LLVM_DEBUG(dbgs() << "  MustSet size: " << MustSet.size() << "\n");
-
-    SUnit *Candidate = selectCandidate(DAGInstrs, SU, MustSet);
+    SUnit *Candidate = selectCandidateFromPool(DAGInstrs, SU);
     if (!Candidate) {
-      // Didn't find a candidate, so node is already maximally constrained.
       LLVM_DEBUG(dbgs() << "  No valid candidate found\n");
       continue;
     }
@@ -2639,11 +2633,17 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
                       << ") -> SU(" << SU->NodeNum
                       << ") (PQ size: " << PQ.size() << ")\n");
 
-    // Update the analysis and priority queue based on the new edge
     incrementalUpdate(DAGInstrs, SU, Candidate);
-
-    // Insert the artificial edge.
     DAGInstrs->addEdge(SU, SDep(Candidate, SDep::Artificial));
+
+    // Re-insert SU if it still has candidates and non-zero priority.
+    if (!CandidatePool[SU].empty()) {
+      unsigned Priority = computePriority(SU);
+      if (Priority) {
+        CachedPriority[SU] = Priority;
+        PQ.insert(SU);
+      }
+    }
   }
 
   LLVM_DEBUG(dbgs() << "*** End live range reduction mutation ***\n");
@@ -2658,8 +2658,7 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
     SUnit &SU = DAGInstrs->SUnits[*It];
     unsigned MaxMinDef = 0;
     for (const SDep &Pred : SU.Preds) {
-      // Skip weak and anti-dependencies
-      if (Pred.getKind() == SDep::Anti || Pred.isWeak())
+      if (Pred.isWeak() || Pred.getKind() == SDep::Anti)
         continue;
 
       SUnit *PredSU = Pred.getSUnit();
@@ -2681,22 +2680,20 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
     unsigned MaxMaxDef = 0;
 
     for (const SDep &Succ : SU.Succs) {
-      // Skip weak and anti-dependencies
-      if (Succ.getKind() == SDep::Anti || Succ.isWeak())
+      if (Succ.isWeak() || Succ.getKind() == SDep::Anti)
         continue;
 
       SUnit *SuccSU = Succ.getSUnit();
       if (SuccSU->isBoundaryNode())
         continue;
+
       assert(MaxDef.contains(SuccSU) &&
              "SUnits should be visited in reverse topological order");
+
       MinMaxDef = std::min(MinMaxDef, MaxDef[SuccSU] - 1);
 
-      // Only artificial or data successors contribute to kill
-      if (!Succ.isArtificial() && Succ.getKind() != SDep::Data)
-        continue;
-
-      MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
+      if (Succ.getKind() == SDep::Data)
+        MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
     }
 
     MaxDef[&SU] = MinMaxDef;
@@ -2792,12 +2789,15 @@ unsigned LiveRangeReductionMutation::computePriority(SUnit *SU) {
     ++Delta;
   }
 
+  assert(MaxKill[SU] >= MinDef[SU] &&
+         "MaxKill < MinDef: forward and backward propagation crossed");
   return (MaxKill[SU] - MinDef[SU]) * Delta;
 }
 
 void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
                                                    SUnit *Target,
                                                    SUnit *Source) {
+  static SmallVector<SUnit *, 16> Worklist;
   SmallPtrSet<SUnit *, 16> DefDirty, KillDirty, PQDirty;
 
   // Source gains a new successor, so its MaxKill may need recomputing
@@ -2805,17 +2805,16 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
 
   // Forward propagate MinDef
   if (MinDef[Source] + 1 > MinDef[Target]) {
-    SmallVector<SUnit *, 16> FwdQ;
-    FwdQ.push_back(Target);
+    Worklist.clear();
+    Worklist.push_back(Target);
 
-    for (unsigned I = 0; I < FwdQ.size(); ++I) {
-      SUnit *SU = FwdQ[I];
+    for (unsigned I = 0; I < Worklist.size(); ++I) {
+      SUnit *SU = Worklist[I];
 
       // FIXME(@cofibrant) this is duplicated from `initRangeBounds()`
-      unsigned MaxMinDef = 0;
+      unsigned MaxMinDef = (SU == Target) ? MinDef[Source] + 1 : 0;
       for (const SDep &Pred : SU->Preds) {
-        // Skip weak and anti-dependencies
-        if (Pred.getKind() == SDep::Anti || Pred.isWeak())
+        if (Pred.isWeak() || Pred.getKind() == SDep::Anti)
           continue;
 
         SUnit *PredSU = Pred.getSUnit();
@@ -2831,28 +2830,27 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
       DefDirty.insert(SU);
 
       for (const SDep &Succ : SU->Succs) {
-        // Skip weak and anti-dependencies
-        if (Succ.getKind() == SDep::Anti || Succ.isWeak())
+        if (Succ.isWeak() || Succ.getKind() == SDep::Anti)
           continue;
 
-        FwdQ.push_back(Succ.getSUnit());
+        Worklist.push_back(Succ.getSUnit());
       }
     }
   }
 
   // Backward propagate MaxDef
   if (MaxDef[Target] - 1 < MaxDef[Source]) {
-    SmallVector<SUnit *, 16> BwdQ;
-    BwdQ.push_back(Source);
+    Worklist.clear();
+    Worklist.push_back(Source);
 
-    for (unsigned I = 0; I < BwdQ.size(); ++I) {
-      SUnit *SU = BwdQ[I];
+    for (unsigned I = 0; I < Worklist.size(); ++I) {
+      SUnit *SU = Worklist[I];
 
       // FIXME(@cofibrant) this is duplicated from `initRangeBounds()`
-      unsigned MinMaxDef = DAGInstrs->SUnits.size() - 1;
+      unsigned MinMaxDef =
+          (SU == Source) ? MaxDef[Target] - 1 : DAGInstrs->SUnits.size() - 1;
       for (const SDep &Succ : SU->Succs) {
-        // Skip weak and anti-dependencies
-        if (Succ.getKind() == SDep::Anti || Succ.isWeak())
+        if (Succ.isWeak() || Succ.getKind() == SDep::Anti)
           continue;
 
         SUnit *SuccSU = Succ.getSUnit();
@@ -2868,14 +2866,13 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
       DefDirty.insert(SU);
 
       for (const SDep &Pred : SU->Preds) {
-        // Skip weak and anti-dependencies
-        if (Pred.getKind() == SDep::Anti || Pred.isWeak())
+        if (Pred.isWeak() || Pred.getKind() == SDep::Anti)
           continue;
 
         if (Pred.getSUnit()->isBoundaryNode())
           continue;
 
-        BwdQ.push_back(Pred.getSUnit());
+        Worklist.push_back(Pred.getSUnit());
       }
     }
   }
@@ -2886,8 +2883,7 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
       unsigned MaxMaxDef = MaxDef[SU];
 
       for (const SDep &Succ : SU->Succs) {
-        // Only artificial or data successors contribute to kill
-        if (!Succ.isArtificial() && Succ.getKind() != SDep::Data)
+        if (Succ.getKind() != SDep::Data)
           continue;
 
         SUnit *SuccSU = Succ.getSUnit();
@@ -2906,7 +2902,7 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
     UpdateMinMaxKill(Dirty);
 
     for (const SDep &Pred : Dirty->Preds) {
-      if (!Pred.isArtificial() && Pred.getKind() != SDep::Data)
+      if (Pred.getKind() != SDep::Data)
         continue;
       if (Pred.getSUnit()->isBoundaryNode())
         continue;
@@ -2932,11 +2928,11 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
     }
   }
 
-  // Repair must clash map: only change will be that predecessors of Target now
-  // must clash with Source
+  // Add new candidates: predecessors of Target now must-clash with Source
+  // (they share Target as a common data successor). MustClash itself doesn't
+  // need repair since it only depends on data edges which are static.
   for (const SDep &Pred : Target->Preds) {
-    // Skip weak and anti-dependencies
-    if (Pred.getKind() == SDep::Anti || Pred.isWeak())
+    if (Pred.isWeak() || Pred.getKind() == SDep::Anti)
       continue;
 
     SUnit *PredSU = Pred.getSUnit();
@@ -2946,8 +2942,11 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
     if (!MayClash[Source].contains(PredSU))
       continue;
 
-    MustClash[Source].insert(PredSU);
-    MustClash[PredSU].insert(Source);
+    if (selectionHeuristic(Source, PredSU) > 0)
+      CandidatePool[Source].push_back(PredSU);
+    if (selectionHeuristic(PredSU, Source) > 0)
+      CandidatePool[PredSU].push_back(Source);
+
     PQDirty.insert(Source);
     PQDirty.insert(PredSU);
   }
@@ -2957,33 +2956,46 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
     updatePriority(Dirty);
 }
 
-// Given an SUnit and a set of candidate SUnits, selects a candidate
-// Assumes that each candidate must clash with the given SU.
-SUnit *LiveRangeReductionMutation::selectCandidate(
-    ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
-    SmallPtrSet<SUnit *, 4> &Candidates) {
-  SUnit *Chosen = nullptr;
-  int MaxScore = 0;
+void LiveRangeReductionMutation::initCandidatePools() {
+  for (auto &Entry : MustClash) {
+    SUnit *SU = Entry.first;
+    SmallVector<SUnit *, 4> &Pool = CandidatePool[SU];
+    SmallPtrSet<SUnit *, 4> &MustSet = Entry.second;
+    Pool.assign(MustSet.begin(), MustSet.end());
+  }
+}
 
-  for (SUnit *Candidate : Candidates) {
-    // Skip any candidates for which an edge would introduce a cycle.
-    if (!DAGInstrs->canAddEdge(SU, Candidate)) {
-      LLVM_DEBUG(dbgs() << "  Candidate SU(" << Candidate->NodeNum
-                        << "): canAddEdge=false, skipping\n");
+SUnit *LiveRangeReductionMutation::selectCandidateFromPool(
+    ScheduleDAGInstrs *DAGInstrs, SUnit *SU) {
+  auto It = CandidatePool.find(SU);
+  if (It == CandidatePool.end())
+    return nullptr;
+
+  SmallVector<SUnit *, 4> &Pool = It->second;
+
+  llvm::sort(Pool, [&](SUnit *A, SUnit *B) {
+    return selectionHeuristic(SU, A) < selectionHeuristic(SU, B);
+  });
+  while (!Pool.empty() && selectionHeuristic(SU, Pool.back()) <= 0)
+    Pool.pop_back();
+
+  while (!Pool.empty()) {
+    SUnit *Best = Pool.back();
+
+    if (!DAGInstrs->canAddEdge(SU, Best)) {
+      LLVM_DEBUG(dbgs() << "  Candidate SU(" << Best->NodeNum
+                        << "): canAddEdge=false, evicting\n");
+      Pool.pop_back();
       continue;
     }
 
-    LLVM_DEBUG(dbgs() << "  Candidate SU(" << Candidate->NodeNum
+    LLVM_DEBUG(dbgs() << "  Candidate SU(" << Best->NodeNum
                       << "): canAddEdge=true\n");
-
-    int Score = selectionHeuristic(SU, Candidate);
-    if (Score > MaxScore) {
-      MaxScore = Score;
-      Chosen = Candidate;
-    }
+    Pool.pop_back();
+    return Best;
   }
 
-  return Chosen;
+  return nullptr;
 }
 
 int LiveRangeReductionMutation::selectionHeuristic(SUnit *SU,
