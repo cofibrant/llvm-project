@@ -2502,8 +2502,7 @@ class LiveRangeReductionMutation : public ScheduleDAGMutation {
   // Invariant: all SUnits in PQ have non-zero priority--i.e.,
   // `CachedPriority[SU] != 0`.
   std::set<SUnit *, SUnitCompare> PQ;
-
-  DenseMap<SUnit *, SmallVector<SUnit *, 4>> CandidatePool;
+  SmallVector<SUnit *, 16> Worklist;
 
 public:
   LiveRangeReductionMutation(const TargetInstrInfo *TII,
@@ -2515,12 +2514,11 @@ public:
 private:
   void initRangeBounds(ScheduleDAGInstrs *DAGInstrs);
   void initClashMaps(ScheduleDAGInstrs *DAGInstrs);
-  void initCandidatePools();
   void initPriorityQueue(ScheduleDAGInstrs *DAGInstrs);
   unsigned computePriority(SUnit *SU);
   void incrementalUpdate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
                          SUnit *Candidate);
-  SUnit *selectCandidateFromPool(ScheduleDAGInstrs *DAGInstrs, SUnit *SU);
+  SUnit *selectCandidate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU);
   int selectionHeuristic(SUnit *SU, SUnit *Candidate);
   void dumpAnalysis();
 
@@ -2554,7 +2552,7 @@ private:
     if (!PQ.erase(SU))
       return;
     unsigned Priority = computePriority(SU);
-    if (Priority && !CandidatePool[SU].empty()) {
+    if (Priority) {
       CachedPriority[SU] = Priority;
       PQ.insert(SU);
     }
@@ -2608,42 +2606,30 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
   MaxKill.clear();
   MustClash.clear();
   MayClash.clear();
-  CandidatePool.clear();
   PQ.clear();
 
   initRangeBounds(DAGInstrs);
   initClashMaps(DAGInstrs);
-  initCandidatePools();
   initPriorityQueue(DAGInstrs);
 
   while (!PQ.empty()) {
     SUnit *SU = popMax();
 
-    LLVM_DEBUG(dbgs() << "Processing SU(" << SU->NodeNum << ") priority="
-                      << CachedPriority[SU] << " with "
-                      << CandidatePool[SU].size() << " candidates\n");
+    LLVM_DEBUG(dbgs() << "Processing SU(" << SU->NodeNum
+                      << ") priority=" << CachedPriority[SU]
+                      << " (PQ size: " << PQ.size() << ")\n");
 
-    SUnit *Candidate = selectCandidateFromPool(DAGInstrs, SU);
+    SUnit *Candidate = selectCandidate(DAGInstrs, SU);
     if (!Candidate) {
       LLVM_DEBUG(dbgs() << "  No valid candidate found\n");
       continue;
     }
 
     LLVM_DEBUG(dbgs() << "Adding an edge: SU(" << Candidate->NodeNum
-                      << ") -> SU(" << SU->NodeNum
-                      << ") (PQ size: " << PQ.size() << ")\n");
+                      << ") -> SU(" << SU->NodeNum << ")\n");
 
     incrementalUpdate(DAGInstrs, SU, Candidate);
     DAGInstrs->addEdge(SU, SDep(Candidate, SDep::Artificial));
-
-    // Re-insert SU if it still has candidates and non-zero priority.
-    if (!CandidatePool[SU].empty()) {
-      unsigned Priority = computePriority(SU);
-      if (Priority) {
-        CachedPriority[SU] = Priority;
-        PQ.insert(SU);
-      }
-    }
   }
 
   LLVM_DEBUG(dbgs() << "*** End live range reduction mutation ***\n");
@@ -2701,6 +2687,8 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
     assert(MinDef[&SU] <= MaxDef[&SU] && "Inverted def range");
     assert(MaxDef[&SU] <= MaxKill[&SU] && "MaxKill should exceed MaxDef");
   }
+
+  LLVM_DEBUG(dumpAnalysis());
 }
 
 void LiveRangeReductionMutation::initClashMaps(ScheduleDAGInstrs *DAGInstrs) {
@@ -2753,8 +2741,6 @@ void LiveRangeReductionMutation::initClashMaps(ScheduleDAGInstrs *DAGInstrs) {
       MustClash[&Other].insert(&SU);
     }
   }
-
-  LLVM_DEBUG(dumpAnalysis());
 }
 
 void LiveRangeReductionMutation::initPriorityQueue(
@@ -2777,8 +2763,6 @@ void LiveRangeReductionMutation::initPriorityQueue(
     if (CachedPriority[&SU])
       PQ.insert(&SU);
   }
-
-  LLVM_DEBUG(dbgs() << "PQ size: " << PQ.size() << "\n");
 }
 
 unsigned LiveRangeReductionMutation::computePriority(SUnit *SU) {
@@ -2790,15 +2774,14 @@ unsigned LiveRangeReductionMutation::computePriority(SUnit *SU) {
   }
 
   assert(MaxKill[SU] >= MinDef[SU] &&
-         "MaxKill < MinDef: forward and backward propagation crossed");
+         "forward and backward propagation crossed");
   return (MaxKill[SU] - MinDef[SU]) * Delta;
 }
 
 void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
                                                    SUnit *Target,
                                                    SUnit *Source) {
-  static SmallVector<SUnit *, 16> Worklist;
-  SmallPtrSet<SUnit *, 16> DefDirty, KillDirty, PQDirty;
+  SmallPtrSet<SUnit *, 16> DefDirty, PQDirty;
 
   // Source gains a new successor, so its MaxKill may need recomputing
   DefDirty.insert(Source);
@@ -2831,6 +2814,9 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
 
       for (const SDep &Succ : SU->Succs) {
         if (Succ.isWeak() || Succ.getKind() == SDep::Anti)
+          continue;
+
+        if (Succ.getSUnit()->isBoundaryNode())
           continue;
 
         Worklist.push_back(Succ.getSUnit());
@@ -2878,6 +2864,7 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
   }
 
   // Maintain MaxKill
+  Worklist.clear();
   for (SUnit *Dirty : DefDirty) {
     auto UpdateMinMaxKill = [&](SUnit *SU) {
       unsigned MaxMaxDef = MaxDef[SU];
@@ -2896,7 +2883,7 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
         return;
 
       MaxKill[SU] = MaxMaxDef;
-      KillDirty.insert(SU);
+      Worklist.push_back(SU);
     };
 
     UpdateMinMaxKill(Dirty);
@@ -2910,17 +2897,20 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
     }
   }
 
+  for (SUnit *Dirty : Worklist)
+    DefDirty.insert(Dirty);
+
   // Repair may clash map
-  for (SUnit *Dirty : llvm::concat<SUnit *>(DefDirty, KillDirty)) {
+  Worklist.clear();
+  for (SUnit *Dirty : DefDirty) {
     // Repair may-clash
-    SmallVector<SUnit *, 4> ToRemove;
     for (SUnit *Clash : MayClash[Dirty]) {
       if (mayClash(Dirty, Clash))
         continue;
-      ToRemove.push_back(Clash);
+      Worklist.push_back(Clash);
     }
 
-    for (SUnit *Clash : ToRemove) {
+    for (SUnit *Clash : Worklist) {
       MayClash[Dirty].erase(Clash);
       MayClash[Clash].erase(Dirty);
       PQDirty.insert(Dirty);
@@ -2928,83 +2918,36 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
     }
   }
 
-  // Add new candidates: predecessors of Target now must-clash with Source
-  // (they share Target as a common data successor). MustClash itself doesn't
-  // need repair since it only depends on data edges which are static.
-  for (const SDep &Pred : Target->Preds) {
-    if (Pred.isWeak() || Pred.getKind() == SDep::Anti)
-      continue;
-
-    SUnit *PredSU = Pred.getSUnit();
-    if (PredSU->isBoundaryNode())
-      continue;
-
-    if (!MayClash[Source].contains(PredSU))
-      continue;
-
-    if (selectionHeuristic(Source, PredSU) > 0)
-      CandidatePool[Source].push_back(PredSU);
-    if (selectionHeuristic(PredSU, Source) > 0)
-      CandidatePool[PredSU].push_back(Source);
-
-    PQDirty.insert(Source);
-    PQDirty.insert(PredSU);
-  }
-
   // Refresh priority queue
   for (SUnit *Dirty : PQDirty)
     updatePriority(Dirty);
+
+  Worklist.clear();
 }
 
-void LiveRangeReductionMutation::initCandidatePools() {
-  for (auto &Entry : MustClash) {
-    SUnit *SU = Entry.first;
-    SmallVector<SUnit *, 4> &Pool = CandidatePool[SU];
-    SmallPtrSet<SUnit *, 4> &MustSet = Entry.second;
-    Pool.assign(MustSet.begin(), MustSet.end());
-  }
-}
-
-SUnit *LiveRangeReductionMutation::selectCandidateFromPool(
-    ScheduleDAGInstrs *DAGInstrs, SUnit *SU) {
-  auto It = CandidatePool.find(SU);
-  if (It == CandidatePool.end())
-    return nullptr;
-
-  SmallVector<SUnit *, 4> &Pool = It->second;
-
-  llvm::sort(Pool, [&](SUnit *A, SUnit *B) {
-    return selectionHeuristic(SU, A) < selectionHeuristic(SU, B);
+SUnit *LiveRangeReductionMutation::selectCandidate(ScheduleDAGInstrs *DAGInstrs,
+                                                   SUnit *SU) {
+  Worklist.assign(MayClash[SU].begin(), MayClash[SU].end());
+  llvm::sort(Worklist, [&](SUnit *A, SUnit *B) {
+    return std::tie(MinDef[A], A->NodeNum) > std::tie(MinDef[B], B->NodeNum);
   });
-  while (!Pool.empty() && selectionHeuristic(SU, Pool.back()) <= 0)
-    Pool.pop_back();
 
-  while (!Pool.empty()) {
-    SUnit *Best = Pool.back();
-
-    if (!DAGInstrs->canAddEdge(SU, Best)) {
-      LLVM_DEBUG(dbgs() << "  Candidate SU(" << Best->NodeNum
-                        << "): canAddEdge=false, evicting\n");
-      Pool.pop_back();
+  for (SUnit *Candidate : Worklist) {
+    if (selectionHeuristic(SU, Candidate) <= 0)
+      break;
+    if (!DAGInstrs->canAddEdge(SU, Candidate))
       continue;
-    }
-
-    LLVM_DEBUG(dbgs() << "  Candidate SU(" << Best->NodeNum
-                      << "): canAddEdge=true\n");
-    Pool.pop_back();
-    return Best;
+    Worklist.clear();
+    return Candidate;
   }
 
+  Worklist.clear();
   return nullptr;
 }
 
 int LiveRangeReductionMutation::selectionHeuristic(SUnit *SU,
                                                     SUnit *Candidate) {
-  int MinDefDelta = static_cast<int>(MinDef[Candidate]) + 1 -
-                    static_cast<int>(MinDef[SU]);
-  int MaxDefDelta = static_cast<int>(MaxDef[Candidate]) + 1 -
-                    static_cast<int>(MaxDef[SU]);
-  return MinDefDelta + MaxDefDelta;
+  return static_cast<int>(MinDef[Candidate]) + 1 - static_cast<int>(MinDef[SU]);
 }
 
 void LiveRangeReductionMutation::dumpAnalysis() {
@@ -3013,17 +2956,6 @@ void LiveRangeReductionMutation::dumpAnalysis() {
     dbgs() << "SU(" << SU->NodeNum << "):"
            << " [" << MinDef[SU] << "," << MaxKill[SU] << ")\n";
   }
-
-  // dbgs() << "Clash analysis dump:\n";
-  // for (SUnit *SU : MayClash.keys()) {
-  //   dbgs() << "SU(" << SU->NodeNum << ")\n  MustClash: ";
-  //   for (SUnit *ClashSU : MustClash[SU])
-  //     dbgs() << "SU(" << ClashSU->NodeNum << ") ";
-  //   dbgs() << "\n  MayClash: ";
-  //   for (SUnit *ClashSU : MayClash[SU])
-  //     dbgs() << "SU(" << ClashSU->NodeNum << ") ";
-  //   dbgs() << "\n";
-  // }
 }
 
 //===----------------------------------------------------------------------===//
