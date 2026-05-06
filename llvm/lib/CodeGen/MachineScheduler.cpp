@@ -2495,10 +2495,11 @@ class LiveRangeReductionMutation : public ScheduleDAGMutation {
   [[maybe_unused]] const TargetInstrInfo *TII;
   [[maybe_unused]] const TargetRegisterInfo *TRI;
 
-  ClashMap MustClash, MayClash;
   RangeBound MinDef, MaxDef, MaxKill;
 
+  DenseMap<SUnit *, SmallSet<unsigned, 4>> DefdPSets;
   DenseMap<SUnit *, unsigned> CachedPriority;
+  DenseMap<SUnit *, unsigned> ReducibleClashes;
   // Invariant: all SUnits in PQ have non-zero priority--i.e.,
   // `CachedPriority[SU] != 0`.
   std::set<SUnit *, SUnitCompare> PQ;
@@ -2513,8 +2514,8 @@ public:
 
 private:
   void initRangeBounds(ScheduleDAGInstrs *DAGInstrs);
-  void initClashMaps(ScheduleDAGInstrs *DAGInstrs);
   void initPriorityQueue(ScheduleDAGInstrs *DAGInstrs);
+  void initDefdPSets(ScheduleDAGInstrs *DAGInstrs);
   unsigned computePriority(SUnit *SU);
   void incrementalUpdate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
                          SUnit *Candidate);
@@ -2523,11 +2524,20 @@ private:
   void dumpAnalysis();
 
   bool mayClash(SUnit *A, SUnit *B) {
-    return MaxKill[A] >= MinDef[B] && MaxKill[B] >= MinDef[A];
+    if (MaxKill[A] < MinDef[B])
+      return false;
+    if (MaxKill[B] < MinDef[A])
+      return false;
+
+    for (unsigned PSet : DefdPSets[A]) {
+      if (DefdPSets[B].contains(PSet))
+        return true;
+    }
+
+    return false;
   }
 
   bool mustClash(SUnit *A, SUnit *B) {
-    // Validate that a data successor of A is a data successor of B
     for (const SDep &Succ : A->Succs) {
       if (Succ.getKind() != SDep::Data)
         continue;
@@ -2573,43 +2583,30 @@ llvm::createLiveRangeReductionMutation(const TargetInstrInfo *TII,
   return std::make_unique<LiveRangeReductionMutation>(TII, TRI);
 }
 
-template <typename Fn>
-static void forEachDefdPSet(const SUnit *SU, const MachineRegisterInfo &MRI,
-                            Fn F) {
-  for (const MachineOperand &MO : SU->getInstr()->defs()) {
-    Register Reg = MO.getReg();
-    // TODO(@cofibrant) handle physical registers.
-    if (!Reg.isVirtual())
-      continue;
-
-    for (PSetIterator PSetI = MRI.getPressureSets(VirtRegOrUnit(Reg));
-         PSetI.isValid(); ++PSetI)
-      if (F(*PSetI))
-        return;
-  }
-}
-
-template <unsigned SmallSize>
-static void collectDefdPSets(const SUnit *SU, const MachineRegisterInfo &MRI,
-                             SmallSet<unsigned, SmallSize> &DefdPSets) {
-  forEachDefdPSet(SU, MRI, [&](unsigned PSet) {
-    DefdPSets.insert(PSet);
-    return false;
-  });
-}
-
 void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
   LLVM_DEBUG(dbgs() << "*** Begin live range reduction mutation ***\n");
 
   MinDef.clear();
   MaxDef.clear();
   MaxKill.clear();
-  MustClash.clear();
-  MayClash.clear();
+  DefdPSets.clear();
+  ReducibleClashes.clear();
   PQ.clear();
 
   initRangeBounds(DAGInstrs);
-  initClashMaps(DAGInstrs);
+  initDefdPSets(DAGInstrs);
+
+  for (SUnit &SU : DAGInstrs->SUnits) {
+    unsigned Count = 0;
+    for (SUnit &Other : DAGInstrs->SUnits) {
+      if (&Other == &SU)
+        continue;
+      if (mayClash(&SU, &Other) && !mustClash(&SU, &Other))
+        ++Count;
+    }
+    ReducibleClashes[&SU] = Count;
+  }
+
   initPriorityQueue(DAGInstrs);
 
   while (!PQ.empty()) {
@@ -2691,58 +2688,6 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
   LLVM_DEBUG(dumpAnalysis());
 }
 
-void LiveRangeReductionMutation::initClashMaps(ScheduleDAGInstrs *DAGInstrs) {
-  LLVM_DEBUG(dbgs() << "initClashMaps: " << DAGInstrs->SUnits.size()
-                    << " SUnits\n");
-
-  const MachineRegisterInfo &MRI = DAGInstrs->MF.getRegInfo();
-  SmallSet<unsigned, 4> DefdPSets;
-
-  // Initialise MustClash and MayClash
-  for (SUnit &SU : DAGInstrs->SUnits) {
-    if (!SU.isInstr())
-      continue;
-
-    DefdPSets.clear();
-    collectDefdPSets(&SU, MRI, DefdPSets);
-
-    LLVM_DEBUG(dbgs() << "Processing SU(" << SU.NodeNum << ")\n";
-               SU.getInstr()->dump(); dbgs() << "DefdPSets:";
-               for (unsigned PS : DefdPSets) dbgs() << " " << PS;
-               dbgs() << "\n";);
-
-    for (SUnit &Other : DAGInstrs->SUnits) {
-      // Analysis is symmetrical
-      if (Other.NodeNum >= SU.NodeNum)
-        continue;
-
-      // If two SUnits may not clash, it is impossible that they must clash so
-      // abort
-      if (!mayClash(&SU, &Other))
-        continue;
-
-      // Check that SU and Other def a common PSet
-      bool DefCommonPSet = false;
-      forEachDefdPSet(&Other, MRI, [&](unsigned PSet) {
-        DefCommonPSet |= DefdPSets.contains(PSet);
-        return DefCommonPSet;
-      });
-
-      if (!DefCommonPSet)
-        continue;
-
-      MayClash[&SU].insert(&Other);
-      MayClash[&Other].insert(&SU);
-
-      if (!mustClash(&SU, &Other))
-        continue;
-
-      MustClash[&SU].insert(&Other);
-      MustClash[&Other].insert(&SU);
-    }
-  }
-}
-
 void LiveRangeReductionMutation::initPriorityQueue(
     ScheduleDAGInstrs *DAGInstrs) {
   LLVM_DEBUG(dbgs() << "initPriorityQueue: " << DAGInstrs->SUnits.size()
@@ -2765,17 +2710,30 @@ void LiveRangeReductionMutation::initPriorityQueue(
   }
 }
 
-unsigned LiveRangeReductionMutation::computePriority(SUnit *SU) {
-  unsigned Delta = 0;
-  for (SUnit *Clash : MayClash[SU]) {
-    if (MustClash[SU].contains(Clash))
-      continue;
-    ++Delta;
-  }
+void LiveRangeReductionMutation::initDefdPSets(ScheduleDAGInstrs *DAGInstrs) {
+  const MachineRegisterInfo &MRI = DAGInstrs->MF.getRegInfo();
 
+  for (SUnit &SU : DAGInstrs->SUnits) {
+    if (SU.isBoundaryNode())
+      continue;
+
+    for (const MachineOperand &MO : SU.getInstr()->defs()) {
+      Register Reg = MO.getReg();
+      // TODO(@cofibrant) handle physical registers.
+      if (!Reg.isVirtual())
+        continue;
+
+      for (PSetIterator PSetI = MRI.getPressureSets(VirtRegOrUnit(Reg));
+           PSetI.isValid(); ++PSetI)
+        DefdPSets[&SU].insert(*PSetI);
+    }
+  }
+}
+
+unsigned LiveRangeReductionMutation::computePriority(SUnit *SU) {
   assert(MaxKill[SU] >= MinDef[SU] &&
          "forward and backward propagation crossed");
-  return (MaxKill[SU] - MinDef[SU]) * Delta;
+  return (MaxKill[SU] - MinDef[SU]) * ReducibleClashes[SU];
 }
 
 void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
@@ -2897,44 +2855,29 @@ void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
     }
   }
 
-  for (SUnit *Dirty : Worklist)
-    DefDirty.insert(Dirty);
-
-  // Repair may clash map
-  Worklist.clear();
-  for (SUnit *Dirty : DefDirty) {
-    // Repair may-clash
-    for (SUnit *Clash : MayClash[Dirty]) {
-      if (mayClash(Dirty, Clash))
-        continue;
-      Worklist.push_back(Clash);
-    }
-
-    for (SUnit *Clash : Worklist) {
-      MayClash[Dirty].erase(Clash);
-      MayClash[Clash].erase(Dirty);
-      PQDirty.insert(Dirty);
-      PQDirty.insert(Clash);
-    }
-  }
-
   // Refresh priority queue
-  for (SUnit *Dirty : PQDirty)
+  for (SUnit *Dirty : Worklist)
     updatePriority(Dirty);
-
+  for (SUnit *Dirty : DefDirty)
+    updatePriority(Dirty);
   Worklist.clear();
 }
 
 SUnit *LiveRangeReductionMutation::selectCandidate(ScheduleDAGInstrs *DAGInstrs,
                                                    SUnit *SU) {
-  Worklist.assign(MayClash[SU].begin(), MayClash[SU].end());
+  for (unsigned I = 0, E = DAGInstrs->SUnits.size(); I != E; ++I)
+    Worklist.push_back(&DAGInstrs->SUnits[I]);
   llvm::sort(Worklist, [&](SUnit *A, SUnit *B) {
     return std::tie(MinDef[A], A->NodeNum) > std::tie(MinDef[B], B->NodeNum);
   });
 
   for (SUnit *Candidate : Worklist) {
+    if (Candidate == SU)
+      continue;
     if (selectionHeuristic(SU, Candidate) <= 0)
       break;
+    if (!mayClash(SU, Candidate))
+      continue;
     if (!DAGInstrs->canAddEdge(SU, Candidate))
       continue;
     Worklist.clear();
