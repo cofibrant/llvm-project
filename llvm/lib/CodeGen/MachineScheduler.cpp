@@ -2474,36 +2474,9 @@ void CopyConstrain::apply(ScheduleDAGInstrs *DAGInstrs) {
 
 namespace {
 
-using ClashMap = DenseMap<SUnit *, SmallPtrSet<SUnit *, 4>>;
-using RangeBound = DenseMap<SUnit *, unsigned>;
-
 class LiveRangeReductionMutation : public ScheduleDAGMutation {
-  struct SUnitCompare {
-    const LiveRangeReductionMutation *Mutation = nullptr;
-
-    bool operator()(const SUnit *A, const SUnit *B) const {
-      unsigned PA = Mutation->CachedPriority.lookup(A);
-      unsigned PB = Mutation->CachedPriority.lookup(B);
-      if (PA != PB)
-        return PA > PB;
-      return A < B;
-    }
-  };
-
-  friend struct SUnitCompare;
-
   [[maybe_unused]] const TargetInstrInfo *TII;
-  [[maybe_unused]] const TargetRegisterInfo *TRI;
-
-  RangeBound MinDef, MaxDef, MaxKill;
-
-  DenseMap<SUnit *, SmallSet<unsigned, 4>> DefdPSets;
-  DenseMap<SUnit *, unsigned> CachedPriority;
-  DenseMap<SUnit *, unsigned> ReducibleClashes;
-  // Invariant: all SUnits in PQ have non-zero priority--i.e.,
-  // `CachedPriority[SU] != 0`.
-  std::set<SUnit *, SUnitCompare> PQ;
-  SmallVector<SUnit *, 16> Worklist;
+  const TargetRegisterInfo *TRI;
 
 public:
   LiveRangeReductionMutation(const TargetInstrInfo *TII,
@@ -2513,67 +2486,28 @@ public:
   void apply(ScheduleDAGInstrs *DAGInstrs) override;
 
 private:
-  void initRangeBounds(ScheduleDAGInstrs *DAGInstrs);
-  void initPriorityQueue(ScheduleDAGInstrs *DAGInstrs);
-  void initDefdPSets(ScheduleDAGInstrs *DAGInstrs);
-  unsigned computePriority(SUnit *SU);
-  void incrementalUpdate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU,
-                         SUnit *Candidate);
-  SUnit *selectCandidate(ScheduleDAGInstrs *DAGInstrs, SUnit *SU);
-  int selectionHeuristic(SUnit *SU, SUnit *Candidate);
-  void dumpAnalysis();
+  // Minimum number of edges that the mutation will consider applying.
+  static const unsigned MinEdges = 50u;
+  // Empirically derived gates for skipping edges with `DefKind == Single` in
+  // cases with insufficient / excessive register pressure.
+  static const unsigned SingleSkipLo = 5u, SingleSkipHi = 50u;
 
-  bool mayClash(SUnit *A, SUnit *B) {
-    if (MaxKill[A] < MinDef[B])
-      return false;
-    if (MaxKill[B] < MinDef[A])
-      return false;
+  // Critical path length.
+  unsigned CriticalPath;
+  // Lower and upper bounds on the cycle where a given value is def'd and when
+  // it is killed.
+  DenseMap<const SUnit *, unsigned> MinDef, MaxDef, MaxKill;
+  // Identifies the weight contribution of each SUnit to each PSet it defines.
+  DenseMap<const SUnit *, SmallVector<unsigned, 32>> DefdPSets;
+  // Peak pressure for each PSet.
+  SmallVector<unsigned, 32> PeakPressure;
+  // Pressure sets exceeding pressure limit in region.
+  SmallVector<unsigned, 8> ExcessPSets;
 
-    for (unsigned PSet : DefdPSets[A]) {
-      if (DefdPSets[B].contains(PSet))
-        return true;
-    }
+  using EdgeSet = SmallVector<std::pair<SUnit *, SUnit *>, 2 * MinEdges>;
 
-    return false;
-  }
-
-  bool mustClash(SUnit *A, SUnit *B) {
-    for (const SDep &Succ : A->Succs) {
-      if (Succ.getKind() != SDep::Data)
-        continue;
-
-      SUnit *SuccSU = Succ.getSUnit();
-      if (SuccSU->isBoundaryNode())
-        continue;
-
-      for (const SDep &Pred : SuccSU->Preds) {
-        if (Pred.getKind() != SDep::Data)
-          continue;
-
-        if (Pred.getSUnit() == B)
-          return true;
-      }
-    }
-
-    return false;
-  }
-
-  void updatePriority(SUnit *SU) {
-    if (!PQ.erase(SU))
-      return;
-    unsigned Priority = computePriority(SU);
-    if (Priority) {
-      CachedPriority[SU] = Priority;
-      PQ.insert(SU);
-    }
-  }
-
-  SUnit *popMax() {
-    auto It = PQ.begin();
-    SUnit *Top = *It;
-    PQ.erase(It);
-    return Top;
-  }
+  void initMetrics(ScheduleDAGInstrs *DAGInstrs);
+  void gatherEdges(ScheduleDAGInstrs *DAGInstrs, EdgeSet &Edges);
 };
 } // end anonymous namespace
 
@@ -2586,59 +2520,63 @@ llvm::createLiveRangeReductionMutation(const TargetInstrInfo *TII,
 void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
   LLVM_DEBUG(dbgs() << "*** Begin live range reduction mutation ***\n");
 
-  MinDef.clear();
-  MaxDef.clear();
-  MaxKill.clear();
-  DefdPSets.clear();
-  ReducibleClashes.clear();
-  PQ.clear();
+  initMetrics(DAGInstrs);
 
-  initRangeBounds(DAGInstrs);
-  initDefdPSets(DAGInstrs);
+  EdgeSet Edges;
+  if (!ExcessPSets.empty())
+    gatherEdges(DAGInstrs, Edges);
 
-  for (SUnit &SU : DAGInstrs->SUnits) {
-    unsigned Count = 0;
-    for (SUnit &Other : DAGInstrs->SUnits) {
-      if (&Other == &SU)
-        continue;
-      if (mayClash(&SU, &Other) && !mustClash(&SU, &Other))
-        ++Count;
+  if (Edges.size() >= MinEdges) {
+    for (auto &[Src, Tgt] : Edges) {
+      LLVM_DEBUG(dbgs() << "  Inserting edge SU(" << Src->NodeNum << ") -> SU("
+                        << Tgt->NodeNum << ")\n");
+      DAGInstrs->addEdge(Tgt, SDep(Src, SDep::Artificial));
     }
-    ReducibleClashes[&SU] = Count;
-  }
-
-  initPriorityQueue(DAGInstrs);
-
-  while (!PQ.empty()) {
-    SUnit *SU = popMax();
-
-    LLVM_DEBUG(dbgs() << "Processing SU(" << SU->NodeNum
-                      << ") priority=" << CachedPriority[SU]
-                      << " (PQ size: " << PQ.size() << ")\n");
-
-    SUnit *Candidate = selectCandidate(DAGInstrs, SU);
-    if (!Candidate) {
-      LLVM_DEBUG(dbgs() << "  No valid candidate found\n");
-      continue;
-    }
-
-    LLVM_DEBUG(dbgs() << "Adding an edge: SU(" << Candidate->NodeNum
-                      << ") -> SU(" << SU->NodeNum << ")\n");
-
-    incrementalUpdate(DAGInstrs, SU, Candidate);
-    DAGInstrs->addEdge(SU, SDep(Candidate, SDep::Artificial));
-  }
+  } else
+    LLVM_DEBUG(dbgs() << "  Only found " << Edges.size() << " (threshold "
+                      << MinEdges << ") edges. Skipping region...\n");
 
   LLVM_DEBUG(dbgs() << "*** End live range reduction mutation ***\n");
 }
 
-void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
-  LLVM_DEBUG(dbgs() << "initRangeBounds: " << DAGInstrs->SUnits.size()
-                    << " SUnits\n");
+void LiveRangeReductionMutation::initMetrics(ScheduleDAGInstrs *DAGInstrs) {
+  CriticalPath = 0;
+  MinDef.clear();
+  MaxDef.clear();
+  MaxKill.clear();
+  DefdPSets.clear();
+  PeakPressure.assign(TRI->getNumRegPressureSets(), 0);
+  ExcessPSets.clear();
+
+  // Gather def'd PSets
+  const MachineRegisterInfo &MRI = DAGInstrs->MRI;
+  for (const SUnit &SU : DAGInstrs->SUnits) {
+    if (SU.isBoundaryNode())
+      continue;
+
+    SmallVector<unsigned, 32> Weights(TRI->getNumRegPressureSets(), 0);
+
+    for (const MachineOperand &MO : SU.getInstr()->defs()) {
+      Register Reg = MO.getReg();
+      // TODO(@cofibrant) handle physical registers.
+      if (!Reg.isVirtual())
+        continue;
+
+      for (PSetIterator PI = MRI.getPressureSets(VirtRegOrUnit(Reg));
+           PI.isValid(); ++PI) {
+        Weights[*PI] += PI.getWeight();
+      }
+    }
+
+    if (any_of(Weights, [](unsigned Weight) { return Weight != 0; }))
+      DefdPSets[&SU] = std::move(Weights);
+  }
+
+  // Compute MinDef in forward topological order
   for (ScheduleDAGInstrs::topo_iterator
            It = DAGInstrs->topo_begin(), E = DAGInstrs->topo_end();
        It != E; ++It) {
-    SUnit &SU = DAGInstrs->SUnits[*It];
+    const SUnit &SU = DAGInstrs->SUnits[*It];
     unsigned MaxMinDef = 0;
     for (const SDep &Pred : SU.Preds) {
       if (Pred.isWeak() || Pred.getKind() == SDep::Anti)
@@ -2649,18 +2587,21 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
         continue;
       assert(MinDef.contains(PredSU) &&
              "SUnits should be visited in topological order");
-      MaxMinDef = std::max(MaxMinDef, MinDef[PredSU] + 1);
+      MaxMinDef = std::max(MaxMinDef, MinDef[PredSU] + Pred.getLatency());
     }
 
     MinDef[&SU] = MaxMinDef;
+    CriticalPath = std::max(MaxMinDef, CriticalPath);
   }
 
+  // Compute an estimate for the remaining cycles of work for each SUnit in
+  // reverse topological order and cache in MaxDef.
+  auto &LongestPath = MaxDef;
   for (ScheduleDAGInstrs::reverse_topo_iterator
            It = DAGInstrs->topo_rbegin(), E = DAGInstrs->topo_rend();
        It != E; ++It) {
-    SUnit &SU = DAGInstrs->SUnits[*It];
-    unsigned MinMaxDef = DAGInstrs->SUnits.size() - 1;
-    unsigned MaxMaxDef = 0;
+    const SUnit &SU = DAGInstrs->SUnits[*It];
+    unsigned MaxLongestPath = 0;
 
     for (const SDep &Succ : SU.Succs) {
       if (Succ.isWeak() || Succ.getKind() == SDep::Anti)
@@ -2669,235 +2610,123 @@ void LiveRangeReductionMutation::initRangeBounds(ScheduleDAGInstrs *DAGInstrs) {
       SUnit *SuccSU = Succ.getSUnit();
       if (SuccSU->isBoundaryNode())
         continue;
-
-      assert(MaxDef.contains(SuccSU) &&
+      assert(LongestPath.contains(SuccSU) &&
              "SUnits should be visited in reverse topological order");
-
-      MinMaxDef = std::min(MinMaxDef, MaxDef[SuccSU] - 1);
-
-      if (Succ.getKind() == SDep::Data)
-        MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
+      MaxLongestPath =
+          std::max(MaxLongestPath, LongestPath[SuccSU] + Succ.getLatency());
     }
 
-    MaxDef[&SU] = MinMaxDef;
-    MaxKill[&SU] = std::max(MaxMaxDef, MaxDef[&SU]);
-    assert(MinDef[&SU] <= MaxDef[&SU] && "Inverted def range");
-    assert(MaxDef[&SU] <= MaxKill[&SU] && "MaxKill should exceed MaxDef");
+    LongestPath[&SU] = MaxLongestPath;
   }
 
-  LLVM_DEBUG(dumpAnalysis());
-}
-
-void LiveRangeReductionMutation::initPriorityQueue(
-    ScheduleDAGInstrs *DAGInstrs) {
-  LLVM_DEBUG(dbgs() << "initPriorityQueue: " << DAGInstrs->SUnits.size()
-                    << " SUnits\n");
-
-  CachedPriority.clear();
+  // Derive MaxDef
   for (SUnit &SU : DAGInstrs->SUnits)
-    CachedPriority[&SU] = computePriority(&SU);
+    MaxDef[&SU] = CriticalPath - LongestPath[&SU];
 
-  LLVM_DEBUG(for (SUnit &SU : DAGInstrs->SUnits) {
-    unsigned P = CachedPriority[&SU];
-    if (P)
-      dbgs() << "  SU(" << SU.NodeNum << ") priority=" << P << "\n";
-  });
-
-  PQ = std::set<SUnit *, SUnitCompare>(SUnitCompare{this});
+  // Compute MaxKill as the maximum MaxDef over data successors whenever such a
+  // successor exists, otherwise the critical path length.
   for (SUnit &SU : DAGInstrs->SUnits) {
-    if (CachedPriority[&SU])
-      PQ.insert(&SU);
+    unsigned MaxMaxDef = MaxDef[&SU];
+    bool HasDataSucc = false;
+
+    for (const SDep &Succ : SU.Succs) {
+      if (Succ.getKind() != SDep::Data)
+        continue;
+
+      SUnit *SuccSU = Succ.getSUnit();
+      if (SuccSU->isBoundaryNode())
+        continue;
+
+      HasDataSucc = true;
+      MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
+    }
+
+    MaxKill[&SU] = HasDataSucc ? MaxMaxDef : CriticalPath;
+  }
+
+  // Compute peak pressure over each PSet
+  SmallVector<int, 128> Deltas;
+  for (unsigned PSet = 0; PSet < TRI->getNumRegPressureSets(); ++PSet) {
+    Deltas.assign(CriticalPath + 2, 0);
+
+    for (const auto &[SU, Weights] : DefdPSets) {
+      if (unsigned Weight = Weights[PSet]) {
+        Deltas[MinDef[SU]] += Weight;
+        Deltas[MaxKill[SU] + 1] -= Weight;
+      }
+    }
+
+    unsigned Peak = 0;
+    unsigned Acc = 0;
+
+    for (unsigned J = 0; J < Deltas.size(); ++J) {
+      Acc += Deltas[J];
+      Peak = std::max(Acc, Peak);
+    }
+
+    PeakPressure[PSet] = Peak;
+    if (Peak > TRI->getRegPressureSetLimit(DAGInstrs->MF, PSet))
+      ExcessPSets.push_back(PSet);
   }
 }
 
-void LiveRangeReductionMutation::initDefdPSets(ScheduleDAGInstrs *DAGInstrs) {
-  const MachineRegisterInfo &MRI = DAGInstrs->MF.getRegInfo();
-
+void LiveRangeReductionMutation::gatherEdges(ScheduleDAGInstrs *DAGInstrs,
+                                             EdgeSet &Edges) {
+  bool FoundFloating = false;
+  SmallVector<const SUnit *, 8> SingleSUnits;
+  // Identify 'floating' defs--i.e., defs with no data-dependent successors and
+  // find corresponding barriers.
   for (SUnit &SU : DAGInstrs->SUnits) {
-    if (SU.isBoundaryNode())
+    // We consider an SU to be a floating def if it defines the target PSet
+    // and has no data-dependent successors.
+    auto It = DefdPSets.find(&SU);
+    if (It == DefdPSets.end())
       continue;
 
-    for (const MachineOperand &MO : SU.getInstr()->defs()) {
-      Register Reg = MO.getReg();
-      // TODO(@cofibrant) handle physical registers.
-      if (!Reg.isVirtual())
-        continue;
-
-      for (PSetIterator PSetI = MRI.getPressureSets(VirtRegOrUnit(Reg));
-           PSetI.isValid(); ++PSetI)
-        DefdPSets[&SU].insert(*PSetI);
-    }
-  }
-}
-
-unsigned LiveRangeReductionMutation::computePriority(SUnit *SU) {
-  assert(MaxKill[SU] >= MinDef[SU] &&
-         "forward and backward propagation crossed");
-  return (MaxKill[SU] - MinDef[SU]) * ReducibleClashes[SU];
-}
-
-void LiveRangeReductionMutation::incrementalUpdate(ScheduleDAGInstrs *DAGInstrs,
-                                                   SUnit *Target,
-                                                   SUnit *Source) {
-  SmallPtrSet<SUnit *, 16> DefDirty, PQDirty;
-
-  // Source gains a new successor, so its MaxKill may need recomputing
-  DefDirty.insert(Source);
-
-  // Forward propagate MinDef
-  if (MinDef[Source] + 1 > MinDef[Target]) {
-    Worklist.clear();
-    Worklist.push_back(Target);
-
-    for (unsigned I = 0; I < Worklist.size(); ++I) {
-      SUnit *SU = Worklist[I];
-
-      // FIXME(@cofibrant) this is duplicated from `initRangeBounds()`
-      unsigned MaxMinDef = (SU == Target) ? MinDef[Source] + 1 : 0;
-      for (const SDep &Pred : SU->Preds) {
-        if (Pred.isWeak() || Pred.getKind() == SDep::Anti)
-          continue;
-
-        SUnit *PredSU = Pred.getSUnit();
-        if (PredSU->isBoundaryNode())
-          continue;
-        MaxMinDef = std::max(MaxMinDef, MinDef[PredSU] + 1);
-      }
-
-      if (MinDef[SU] == MaxMinDef)
-        continue;
-
-      MinDef[SU] = MaxMinDef;
-      DefDirty.insert(SU);
-
-      for (const SDep &Succ : SU->Succs) {
-        if (Succ.isWeak() || Succ.getKind() == SDep::Anti)
-          continue;
-
-        if (Succ.getSUnit()->isBoundaryNode())
-          continue;
-
-        Worklist.push_back(Succ.getSUnit());
-      }
-    }
-  }
-
-  // Backward propagate MaxDef
-  if (MaxDef[Target] - 1 < MaxDef[Source]) {
-    Worklist.clear();
-    Worklist.push_back(Source);
-
-    for (unsigned I = 0; I < Worklist.size(); ++I) {
-      SUnit *SU = Worklist[I];
-
-      // FIXME(@cofibrant) this is duplicated from `initRangeBounds()`
-      unsigned MinMaxDef =
-          (SU == Source) ? MaxDef[Target] - 1 : DAGInstrs->SUnits.size() - 1;
-      for (const SDep &Succ : SU->Succs) {
-        if (Succ.isWeak() || Succ.getKind() == SDep::Anti)
-          continue;
-
-        SUnit *SuccSU = Succ.getSUnit();
-        if (SuccSU->isBoundaryNode())
-          continue;
-        MinMaxDef = std::min(MinMaxDef, MaxDef[SuccSU] - 1);
-      }
-
-      if (MaxDef[SU] == MinMaxDef)
-        continue;
-
-      MaxDef[SU] = MinMaxDef;
-      DefDirty.insert(SU);
-
-      for (const SDep &Pred : SU->Preds) {
-        if (Pred.isWeak() || Pred.getKind() == SDep::Anti)
-          continue;
-
-        if (Pred.getSUnit()->isBoundaryNode())
-          continue;
-
-        Worklist.push_back(Pred.getSUnit());
-      }
-    }
-  }
-
-  // Maintain MaxKill
-  Worklist.clear();
-  for (SUnit *Dirty : DefDirty) {
-    auto UpdateMinMaxKill = [&](SUnit *SU) {
-      unsigned MaxMaxDef = MaxDef[SU];
-
-      for (const SDep &Succ : SU->Succs) {
-        if (Succ.getKind() != SDep::Data)
-          continue;
-
-        SUnit *SuccSU = Succ.getSUnit();
-        if (SuccSU->isBoundaryNode())
-          continue;
-        MaxMaxDef = std::max(MaxMaxDef, MaxDef[SuccSU]);
-      }
-
-      if (MaxMaxDef == MaxKill[SU])
-        return;
-
-      MaxKill[SU] = MaxMaxDef;
-      Worklist.push_back(SU);
-    };
-
-    UpdateMinMaxKill(Dirty);
-
-    for (const SDep &Pred : Dirty->Preds) {
-      if (Pred.getKind() != SDep::Data)
-        continue;
-      if (Pred.getSUnit()->isBoundaryNode())
-        continue;
-      UpdateMinMaxKill(Pred.getSUnit());
-    }
-  }
-
-  // Refresh priority queue
-  for (SUnit *Dirty : Worklist)
-    updatePriority(Dirty);
-  for (SUnit *Dirty : DefDirty)
-    updatePriority(Dirty);
-  Worklist.clear();
-}
-
-SUnit *LiveRangeReductionMutation::selectCandidate(ScheduleDAGInstrs *DAGInstrs,
-                                                   SUnit *SU) {
-  for (unsigned I = 0, E = DAGInstrs->SUnits.size(); I != E; ++I)
-    Worklist.push_back(&DAGInstrs->SUnits[I]);
-  llvm::sort(Worklist, [&](SUnit *A, SUnit *B) {
-    return std::tie(MinDef[A], A->NodeNum) > std::tie(MinDef[B], B->NodeNum);
-  });
-
-  for (SUnit *Candidate : Worklist) {
-    if (Candidate == SU)
+    const auto &Weights = It->second;
+    if (none_of(ExcessPSets, [&](unsigned PSet) { return Weights[PSet] > 0; }))
       continue;
-    if (selectionHeuristic(SU, Candidate) <= 0)
-      break;
-    if (!mayClash(SU, Candidate))
+
+    unsigned NumDataSuccs = count_if(SU.Succs, [=](const SDep &Succ) {
+      return Succ.getKind() == SDep::Data && !Succ.getSUnit()->isBoundaryNode();
+    });
+
+    if (NumDataSuccs == 1)
+      SingleSUnits.push_back(&SU);
+
+    if (NumDataSuccs != 0)
       continue;
-    if (!DAGInstrs->canAddEdge(SU, Candidate))
-      continue;
-    Worklist.clear();
-    return Candidate;
+
+    FoundFloating = true;
+
+    // Find a potential anchor (minimum incomparable node by slack).
+    SUnit *Anchor = nullptr;
+    unsigned MinSlack = std::numeric_limits<unsigned>::max();
+    for (SUnit &Other : DAGInstrs->SUnits) {
+      if (&SU == &Other || DAGInstrs->IsReachable(&SU, &Other) ||
+          DAGInstrs->IsReachable(&Other, &SU))
+        continue;
+
+      unsigned Slack = MaxDef[&Other] - MinDef[&Other];
+      if (MinSlack <= Slack)
+        continue;
+
+      MinSlack = Slack;
+      Anchor = &Other;
+    }
+
+    if (Anchor)
+      Edges.emplace_back(&SU, Anchor);
   }
 
-  Worklist.clear();
-  return nullptr;
-}
+  if (FoundFloating)
+    return;
 
-int LiveRangeReductionMutation::selectionHeuristic(SUnit *SU,
-                                                    SUnit *Candidate) {
-  return static_cast<int>(MinDef[Candidate]) + 1 - static_cast<int>(MinDef[SU]);
-}
-
-void LiveRangeReductionMutation::dumpAnalysis() {
-  dbgs() << "Range analysis dump:\n";
-  for (SUnit *SU : MinDef.keys()) {
-    dbgs() << "SU(" << SU->NodeNum << "):"
-           << " [" << MinDef[SU] << "," << MaxKill[SU] << ")\n";
+  // No floating defs found, fall back to single successor nodes.
+  for (const SUnit *SU : SingleSUnits) {
+    // TODO(@cofibrant)
+    // - Find the barrier for the single node: the minimum among number of
+    //   predecessors with ties broken by node number.
   }
 }
 
