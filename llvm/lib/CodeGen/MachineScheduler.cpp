@@ -2488,9 +2488,6 @@ public:
 private:
   // Minimum number of edges that the mutation will consider applying.
   static const unsigned MinEdges = 50u;
-  // Empirically derived gates for skipping edges with `DefKind == Single` in
-  // cases with insufficient / excessive register pressure.
-  static const unsigned SingleSkipLo = 5u, SingleSkipHi = 50u;
 
   // Critical path length.
   unsigned CriticalPath;
@@ -2508,6 +2505,8 @@ private:
 
   void initMetrics(ScheduleDAGInstrs *DAGInstrs);
   void gatherEdges(ScheduleDAGInstrs *DAGInstrs, EdgeSet &Edges);
+  SUnit *findAnchor(ScheduleDAGInstrs *DAGInstrs, SUnit *Source,
+                    llvm::function_ref<unsigned(SUnit *)> F);
 };
 } // end anonymous namespace
 
@@ -2540,12 +2539,14 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
 }
 
 void LiveRangeReductionMutation::initMetrics(ScheduleDAGInstrs *DAGInstrs) {
+  unsigned NumRegPressureSets = TRI->getNumRegPressureSets();
+
   CriticalPath = 0;
   MinDef.clear();
   MaxDef.clear();
   MaxKill.clear();
   DefdPSets.clear();
-  PeakPressure.assign(TRI->getNumRegPressureSets(), 0);
+  PeakPressure.assign(NumRegPressureSets, 0);
   ExcessPSets.clear();
 
   // Gather def'd PSets
@@ -2554,7 +2555,7 @@ void LiveRangeReductionMutation::initMetrics(ScheduleDAGInstrs *DAGInstrs) {
     if (SU.isBoundaryNode())
       continue;
 
-    SmallVector<unsigned, 32> Weights(TRI->getNumRegPressureSets(), 0);
+    SmallVector<unsigned, 32> Weights(NumRegPressureSets, 0);
 
     for (const MachineOperand &MO : SU.getInstr()->defs()) {
       Register Reg = MO.getReg();
@@ -2646,7 +2647,7 @@ void LiveRangeReductionMutation::initMetrics(ScheduleDAGInstrs *DAGInstrs) {
 
   // Compute peak pressure over each PSet
   SmallVector<int, 128> Deltas;
-  for (unsigned PSet = 0; PSet < TRI->getNumRegPressureSets(); ++PSet) {
+  for (unsigned PSet = 0; PSet < NumRegPressureSets; ++PSet) {
     Deltas.assign(CriticalPath + 2, 0);
 
     for (const auto &[SU, Weights] : DefdPSets) {
@@ -2673,7 +2674,7 @@ void LiveRangeReductionMutation::initMetrics(ScheduleDAGInstrs *DAGInstrs) {
 void LiveRangeReductionMutation::gatherEdges(ScheduleDAGInstrs *DAGInstrs,
                                              EdgeSet &Edges) {
   bool FoundFloating = false;
-  SmallVector<const SUnit *, 8> SingleSUnits;
+  SmallVector<SUnit *, 8> SingleSUnits;
   // Identify 'floating' defs--i.e., defs with no data-dependent successors and
   // find corresponding barriers.
   for (SUnit &SU : DAGInstrs->SUnits) {
@@ -2697,37 +2698,50 @@ void LiveRangeReductionMutation::gatherEdges(ScheduleDAGInstrs *DAGInstrs,
     if (NumDataSuccs != 0)
       continue;
 
-    FoundFloating = true;
+    SUnit *Anchor = findAnchor(DAGInstrs, &SU, [=](SUnit *Other) {
+      return MaxDef[Other] - MinDef[Other];
+    });
 
-    // Find a potential anchor (minimum incomparable node by slack).
-    SUnit *Anchor = nullptr;
-    unsigned MinSlack = std::numeric_limits<unsigned>::max();
-    for (SUnit &Other : DAGInstrs->SUnits) {
-      if (&SU == &Other || DAGInstrs->IsReachable(&SU, &Other) ||
-          DAGInstrs->IsReachable(&Other, &SU))
-        continue;
-
-      unsigned Slack = MaxDef[&Other] - MinDef[&Other];
-      if (MinSlack <= Slack)
-        continue;
-
-      MinSlack = Slack;
-      Anchor = &Other;
-    }
-
-    if (Anchor)
+    if (Anchor) {
       Edges.emplace_back(&SU, Anchor);
+      FoundFloating = true;
+    }
   }
 
   if (FoundFloating)
     return;
 
+  // TODO(@cofibrant) early exit gate to reduce regressions.
+
   // No floating defs found, fall back to single successor nodes.
-  for (const SUnit *SU : SingleSUnits) {
-    // TODO(@cofibrant)
-    // - Find the barrier for the single node: the minimum among number of
-    //   predecessors with ties broken by node number.
+  for (SUnit *SU : SingleSUnits) {
+    SUnit *Anchor = findAnchor(
+        DAGInstrs, SU, [=](SUnit *Other) { return Other->Preds.size(); });
+    if (Anchor)
+      Edges.emplace_back(SU, Anchor);
   }
+}
+
+SUnit *LiveRangeReductionMutation::findAnchor(
+    ScheduleDAGInstrs *DAGInstrs, SUnit *Source,
+    llvm::function_ref<unsigned(SUnit *)> F) {
+  // Find a potential anchor (minimum incomparable node by key).
+  SUnit *Anchor = nullptr;
+  unsigned MinKey = std::numeric_limits<unsigned>::max();
+  for (SUnit &Other : DAGInstrs->SUnits) {
+    if (Source == &Other || DAGInstrs->IsReachable(Source, &Other) ||
+        DAGInstrs->IsReachable(&Other, Source))
+      continue;
+
+    unsigned Key = F(&Other);
+    if (MinKey <= Key)
+      continue;
+
+    MinKey = Key;
+    Anchor = &Other;
+  }
+
+  return Anchor;
 }
 
 //===----------------------------------------------------------------------===//
