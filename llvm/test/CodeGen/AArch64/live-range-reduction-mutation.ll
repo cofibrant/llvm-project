@@ -1,6 +1,6 @@
 ; REQUIRES: asserts
-; RUN: llc < %s -mtriple=arm64-apple-ios -debug-only=machine-scheduler -aarch64-enable-live-range-reduction=true -o /dev/null 2>&1 | FileCheck %s --check-prefix=ENABLED
-; RUN: llc < %s -mtriple=arm64-apple-ios -debug-only=machine-scheduler -aarch64-enable-live-range-reduction=false -o /dev/null 2>&1 | FileCheck %s --check-prefix=DISABLED
+; RUN: llc < %s -mtriple=arm64-apple-ios -debug-only=machine-scheduler -misched-liverangereduction=true -o /dev/null 2>&1 | FileCheck %s --check-prefix=ENABLED
+; RUN: llc < %s -mtriple=arm64-apple-ios -debug-only=machine-scheduler -misched-liverangereduction=false -o /dev/null 2>&1 | FileCheck %s --check-prefix=DISABLED
 
 ; ENABLED: *** Begin live range reduction mutation ***
 ; ENABLED: *** End live range reduction mutation ***

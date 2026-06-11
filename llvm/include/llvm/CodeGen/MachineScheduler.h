@@ -1428,8 +1428,7 @@ createCopyConstrainDAGMutation(const TargetInstrInfo *TII,
                                const TargetRegisterInfo *TRI);
 
 LLVM_ABI std::unique_ptr<ScheduleDAGMutation>
-createLiveRangeReductionMutation(const TargetInstrInfo *TII,
-                                 const TargetRegisterInfo *TRI);
+createLiveRangeReductionMutation(const TargetRegisterInfo *TRI);
 
 /// Create the standard converging machine scheduler. This will be used as the
 /// default scheduler if the target does not set a default.

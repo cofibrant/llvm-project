@@ -267,6 +267,15 @@ static cl::opt<unsigned>
     FastClusterThreshold("fast-cluster-threshold", cl::Hidden,
                          cl::desc("The threshold for fast cluster"),
                          cl::init(1000));
+static cl::opt<bool>
+    EnableLiveRangeReduction("misched-liverangereduction",
+                             cl::desc("Enable live range reduction."),
+                             cl::init(false));
+static cl::opt<unsigned> LiveRangeReductionThreshold(
+    "liverangereduction-threshold",
+    cl::desc(
+        "Minimum number of candidate edges for live range reduction to apply."),
+    cl::init(50));
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
 static cl::opt<bool> MISchedDumpScheduleTrace(
@@ -2475,20 +2484,14 @@ void CopyConstrain::apply(ScheduleDAGInstrs *DAGInstrs) {
 namespace {
 
 class LiveRangeReductionMutation : public ScheduleDAGMutation {
-  [[maybe_unused]] const TargetInstrInfo *TII;
   const TargetRegisterInfo *TRI;
 
 public:
-  LiveRangeReductionMutation(const TargetInstrInfo *TII,
-                             const TargetRegisterInfo *TRI)
-      : TII(TII), TRI(TRI) {}
+  LiveRangeReductionMutation(const TargetRegisterInfo *TRI) : TRI(TRI) {}
 
   void apply(ScheduleDAGInstrs *DAGInstrs) override;
 
 private:
-  // Minimum number of edges that the mutation will consider applying.
-  static const unsigned MinEdges = 50u;
-
   // Critical path length.
   unsigned CriticalPath;
   // Lower and upper bounds on the cycle where a given value is def'd and when
@@ -2501,7 +2504,7 @@ private:
   // Pressure sets exceeding pressure limit in region.
   SmallVector<unsigned, 8> ExcessPSets;
 
-  using EdgeSet = SmallVector<std::pair<SUnit *, SUnit *>, 2 * MinEdges>;
+  using EdgeSet = SmallVector<std::pair<SUnit *, SUnit *>, 32>;
 
   void initMetrics(ScheduleDAGInstrs *DAGInstrs);
   void gatherEdges(ScheduleDAGInstrs *DAGInstrs, EdgeSet &Edges);
@@ -2511,9 +2514,10 @@ private:
 } // end anonymous namespace
 
 std::unique_ptr<ScheduleDAGMutation>
-llvm::createLiveRangeReductionMutation(const TargetInstrInfo *TII,
-                                       const TargetRegisterInfo *TRI) {
-  return std::make_unique<LiveRangeReductionMutation>(TII, TRI);
+llvm::createLiveRangeReductionMutation(const TargetRegisterInfo *TRI) {
+  return EnableLiveRangeReduction
+             ? std::make_unique<LiveRangeReductionMutation>(TRI)
+             : nullptr;
 }
 
 void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
@@ -2525,7 +2529,7 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
   if (!ExcessPSets.empty())
     gatherEdges(DAGInstrs, Edges);
 
-  if (Edges.size() >= MinEdges) {
+  if (Edges.size() >= LiveRangeReductionThreshold) {
     for (auto &[Src, Tgt] : Edges) {
       LLVM_DEBUG(dbgs() << "  Inserting edge SU(" << Src->NodeNum << ") -> SU("
                         << Tgt->NodeNum << ")\n");
@@ -2533,7 +2537,8 @@ void LiveRangeReductionMutation::apply(ScheduleDAGInstrs *DAGInstrs) {
     }
   } else
     LLVM_DEBUG(dbgs() << "  Only found " << Edges.size() << " (threshold "
-                      << MinEdges << ") edges. Skipping region...\n");
+                      << LiveRangeReductionThreshold
+                      << ") edges. Skipping region...\n");
 
   LLVM_DEBUG(dbgs() << "*** End live range reduction mutation ***\n");
 }
@@ -2673,13 +2678,9 @@ void LiveRangeReductionMutation::initMetrics(ScheduleDAGInstrs *DAGInstrs) {
 
 void LiveRangeReductionMutation::gatherEdges(ScheduleDAGInstrs *DAGInstrs,
                                              EdgeSet &Edges) {
-  bool FoundFloating = false;
-  SmallVector<SUnit *, 8> SingleSUnits;
-  // Identify 'floating' defs--i.e., defs with no data-dependent successors and
-  // find corresponding barriers.
+  // Identify 'floating' defs--i.e., defs with no data-dependent successors
+  // within the region--and find corresponding barriers.
   for (SUnit &SU : DAGInstrs->SUnits) {
-    // We consider an SU to be a floating def if it defines the target PSet
-    // and has no data-dependent successors.
     auto It = DefdPSets.find(&SU);
     if (It == DefdPSets.end())
       continue;
@@ -2692,33 +2693,15 @@ void LiveRangeReductionMutation::gatherEdges(ScheduleDAGInstrs *DAGInstrs,
       return Succ.getKind() == SDep::Data && !Succ.getSUnit()->isBoundaryNode();
     });
 
-    if (NumDataSuccs == 1)
-      SingleSUnits.push_back(&SU);
-
     if (NumDataSuccs != 0)
       continue;
 
     SUnit *Anchor = findAnchor(DAGInstrs, &SU, [=](SUnit *Other) {
-      return MaxDef[Other] - MinDef[Other];
+      return MinDef[Other] * (MaxDef[Other] - MinDef[Other]);
     });
 
-    if (Anchor) {
-      Edges.emplace_back(&SU, Anchor);
-      FoundFloating = true;
-    }
-  }
-
-  if (FoundFloating)
-    return;
-
-  // TODO(@cofibrant) early exit gate to reduce regressions.
-
-  // No floating defs found, fall back to single successor nodes.
-  for (SUnit *SU : SingleSUnits) {
-    SUnit *Anchor = findAnchor(
-        DAGInstrs, SU, [=](SUnit *Other) { return Other->Preds.size(); });
     if (Anchor)
-      Edges.emplace_back(SU, Anchor);
+      Edges.emplace_back(&SU, Anchor);
   }
 }
 
