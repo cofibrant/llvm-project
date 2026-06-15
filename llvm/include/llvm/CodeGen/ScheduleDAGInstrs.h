@@ -159,8 +159,6 @@ namespace llvm {
     /// scheduling region is mapped to an SUnit.
     DenseMap<MachineInstr*, SUnit*> MISUnitMap;
 
-    unsigned MemOpsProcessed = 0;
-
     // State internal to DAG building.
     // -------------------------------
 
@@ -184,6 +182,10 @@ namespace llvm {
     /// No other SU ever gets scheduled around it (except in the special
     /// case of a huge region that gets reduced).
     SUnit *BarrierChain = nullptr;
+
+    /// In case there are no instructions with global side effects, we avoid
+    /// constructing the barrier chain and the associated data structures.
+    bool NeedsBarrierChain;
 
     SmallVector<ClusterInfo> Clusters;
 
