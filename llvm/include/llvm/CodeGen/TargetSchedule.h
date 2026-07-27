@@ -170,7 +170,10 @@ public:
   }
 
   /// Number of micro-ops that may be buffered for OOO execution.
-  unsigned getMicroOpBufferSize() const { return SchedModel.MicroOpBufferSize; }
+  unsigned getMicroOpBufferSize() const {
+    return 0;
+    // return SchedModel.MicroOpBufferSize;
+  }
 
   /// Return the original buffer size for a processor resource.
   int getResourceBufferSize(unsigned PIdx) const {
