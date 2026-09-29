@@ -91,7 +91,7 @@ static cl::opt<unsigned>
                         "is made to avoid excessive compile time."));
 
 static cl::opt<bool> EnableStoreSequencing(
-    "enable-unanalyzable-store-sequencing", cl::Hidden, cl::init(false),
+    "enable-unanalyzable-store-sequencing", cl::Hidden, cl::init(true),
     cl::desc("Enable the store-sequencing DAG construction algorithm. This can "
              "eliminate a large number of redundant control dependencies and "
              "spurious alias analysis queries at the cost of some unnecessary "
