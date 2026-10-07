@@ -1194,7 +1194,7 @@ bool ScheduleDAGInstrs::addEdge(SUnit *SuccSU, const SDep &PredDep) {
       return false;
     Topo.AddPredQueued(SuccSU, PredDep.getSUnit());
   }
-  SuccSU->addPred(PredDep, /*Required=*/!PredDep.isArtificial());
+  SuccSU->addPred(PredDep);
   // Return true regardless of whether a new edge needed to be inserted.
   return true;
 }

@@ -103,36 +103,8 @@ LLVM_DUMP_METHOD void SDep::dump(const TargetRegisterInfo *TRI) const {
   }
 }
 
-bool SUnit::addPred(const SDep &D, bool Required) {
-  // If this node already has this dependence, don't add a redundant one.
-  for (SDep &PredDep : Preds) {
-    // Zero-latency weak edges may be added purely for heuristic ordering. Don't
-    // add them if another kind of edge already exists.
-    if (!Required && PredDep.getSUnit() == D.getSUnit())
-      return false;
-    if (PredDep.overlaps(D)) {
-      // Extend the latency if needed. Equivalent to
-      // removePred(PredDep) + addPred(D).
-      if (PredDep.getLatency() < D.getLatency()) {
-        SUnit *PredSU = PredDep.getSUnit();
-        // Find the corresponding successor in N.
-        SDep ForwardD = PredDep;
-        ForwardD.setSUnit(this);
-        for (SDep &SuccDep : PredSU->Succs) {
-          if (SuccDep == ForwardD) {
-            SuccDep.setLatency(D.getLatency());
-            break;
-          }
-        }
-        PredDep.setLatency(D.getLatency());
-        // Changing latency, dirty the involved SUnits.
-        this->setDepthDirty();
-        D.getSUnit()->setHeightDirty();
-      }
-      return false;
-    }
-  }
-  // Now add a corresponding succ to N.
+bool SUnit::addPred(const SDep &D) {
+  // Add a corresponding succ to N.
   SDep P = D;
   P.setSUnit(this);
   SUnit *N = D.getSUnit();

@@ -404,9 +404,9 @@ class TargetRegisterInfo;
       return Instr;
     }
 
-    /// Adds the specified edge as a pred of the current node if not already.
-    /// It also adds the current node as a successor of the specified node.
-    LLVM_ABI bool addPred(const SDep &D, bool Required = true);
+    /// Adds the specified edge as a pred of the current node. It also adds the
+    /// current node as a successor of the specified node.
+    LLVM_ABI bool addPred(const SDep &D);
 
     /// Adds a barrier edge to SU by calling addPred(), with latency 0
     /// generally or latency 1 for a store followed by a load.
