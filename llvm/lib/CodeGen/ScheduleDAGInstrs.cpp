@@ -1362,6 +1362,12 @@ bool ScheduleDAGInstrs::addEdge(SUnit *SuccSU, const SDep &PredDep) {
   return true;
 }
 
+void ScheduleDAGInstrs::removeEdge(SUnit *SuccSU, const SDep &PredDep) {
+  if (SuccSU != &ExitSU)
+    Topo.RemovePred(SuccSU, PredDep.getSUnit());
+  SuccSU->removePred(PredDep);
+}
+
 //===----------------------------------------------------------------------===//
 // SchedDFSResult Implementation
 //===----------------------------------------------------------------------===//

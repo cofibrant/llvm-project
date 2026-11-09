@@ -15,6 +15,7 @@
 #ifndef LLVM_CODEGEN_SCHEDULEDAG_H
 #define LLVM_CODEGEN_SCHEDULEDAG_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/SmallSet.h"
@@ -27,6 +28,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -733,52 +735,169 @@ class TargetRegisterInfo;
     }
   };
 
-  /// This class can compute a topological ordering for SUnits and provides
-  /// methods for dynamically updating the ordering as new edges are added.
+  /// This class maintains a topological ordering of a DAG's SUnits, together
+  /// with labels that answer most reachability queries without a traversal, as
+  /// edges are added and removed.
   ///
-  /// This allows a very fast implementation of IsReachable, for example.
+  /// A query is first checked against O(1) tests:
+  ///   - the topological order: X can only reach Y if Index(X) < Index(Y);
+  ///   - longest-path levels from the sources and to the sinks, which strictly
+  ///     increase (resp. decrease) along every edge;
+  ///   - a few supportive vertices S, for which the nodes reaching S and the
+  ///     nodes reachable from S are maintained exactly;
+  ///   - cached rows of facts about single nodes, recorded by earlier queries.
+  /// If those are inconclusive, a bidirectional search applies the same tests
+  /// at every node it reaches, and records what it learns in the cache.
+  ///
+  /// Updates are queued and applied at the next query or iteration. Every edge
+  /// insertion and removal must be reported, through AddPred/AddPredQueued and
+  /// RemovePred, and must have happened by the time the update is applied.
   class ScheduleDAGTopologicalSort {
+    /// Labels and traversal state for one SUnit.
+    struct NodeInfo {
+      /// Topological index.
+      int Index = 0;
+      /// Length of the longest path from a source, and to a sink.
+      unsigned Level = 0;
+      unsigned RLevel = 0;
+      /// Bit I is set if supportive vertex I reaches this node, or this node
+      /// reaches supportive vertex I. A supportive vertex reaches itself.
+      uint32_t ReachedBy = 0;
+      uint32_t Reaches = 0;
+      /// Bit I is set if this node is supportive vertex I.
+      uint32_t Self = 0;
+      /// This node's rows in DescRows and AncRows, or -1.
+      int DescRow = -1;
+      int AncRow = -1;
+      /// Traversal marks, set when equal to Epoch.
+      unsigned FwdMark = 0;
+      unsigned BwdMark = 0;
+    };
+
+    /// Cached facts about one node: the nodes it is known to reach (or to be
+    /// reached by), and the nodes it is known not to. Insertions can only
+    /// falsify negative facts, and removals positive ones.
+    struct ReachRow {
+      int Node = -1;
+      /// Set on use, and cleared by the eviction sweep.
+      bool Referenced = false;
+      bool PosValid = false;
+      bool NegValid = false;
+      BitVector Pos;
+      BitVector Neg;
+
+      void reset(unsigned NumNodes) {
+        Node = -1;
+        Referenced = PosValid = NegValid = false;
+        Pos.resize(NumNodes);
+        Neg.resize(NumNodes);
+      }
+      BitVector &validPos() {
+        if (!PosValid) {
+          Pos.reset();
+          PosValid = true;
+        }
+        return Pos;
+      }
+      BitVector &validNeg() {
+        if (!NegValid) {
+          Neg.reset();
+          NegValid = true;
+        }
+        return Neg;
+      }
+    };
+
+    /// An edge insertion or removal that has not been applied yet.
+    struct Update {
+      SUnit *Pred;
+      SUnit *Succ;
+      bool IsInsert;
+    };
+
+    enum class Reach { No, Yes, Unknown };
+
+    /// Labels summarising a set of SUnits.
+    struct Bounds;
+
     /// A reference to the ScheduleDAG's SUnits.
     std::vector<SUnit> &SUnits;
-    SUnit *ExitSU;
 
     // Have any new nodes been added?
     bool Dirty = false;
 
-    // Outstanding added edges, that have not been applied to the ordering.
-    SmallVector<std::pair<SUnit *, SUnit *>, 16> Updates;
+    // Outstanding edge updates, that have not been applied yet.
+    SmallVector<Update, 16> Updates;
 
     /// Maps topological index to the node number.
     std::vector<int> Index2Node;
-    /// Maps the node number to its topological index.
-    std::vector<int> Node2Index;
-    /// a set of nodes visited during a DFS traversal.
-    BitVector Visited;
-    /// A worklist for use during traversals. Retained after traversals so must
-    /// be cleared before use.
-    std::vector<const SUnit *> WorkList;
-    /// Cache of reachability queries. {A, B} -> true if B is reachable from A.
-    /// The keys are SUnit NodeNums.
-    DenseMap<std::pair<int, int>, bool> Reachable;
+    /// Labels for each node, indexed by node number.
+    std::vector<NodeInfo> Info;
 
-    /// Makes a DFS traversal and mark all nodes affected by the edge insertion.
-    /// These nodes will later get new topological indexes by means of the Shift
-    /// method.
-    void DFS(const SUnit *SU, int UpperBound, bool& HasLoop);
+    /// Cached rows: descendants of a source, and ancestors of a target. Each
+    /// pool is replaced by a second-chance sweep driven by its clock.
+    SmallVector<ReachRow, 0> DescRows;
+    SmallVector<ReachRow, 0> AncRows;
+    unsigned DescClock = 0;
+    unsigned AncClock = 0;
 
-    /// Reassigns topological indexes for the nodes in the DAG to
-    /// preserve the topological ordering.
-    void Shift(BitVector& Visited, int LowerBound, int UpperBound);
+    /// Scratch space for traversals, retained to avoid reallocation.
+    unsigned Epoch = 0;
+    std::vector<unsigned> FwdStack, BwdStack, FwdSeen, BwdSeen;
+    std::vector<std::pair<int, unsigned>> Heap;
 
-    /// Assigns the topological index to the node n.
-    void Allocate(int n, int index);
+    /// Edges to nodes outside the DAG (e.g. ExitSU) are allowed but ignored.
+    bool inDAG(const SUnit *SU) const { return SU->NodeNum < Info.size(); }
 
-    /// Fix the ordering, by either recomputing from scratch or by applying
-    /// any outstanding updates. Uses a heuristic to estimate what will be
-    /// cheaper.
-    void FixOrder();
+    /// Starts a traversal, invalidating all marks.
+    void newEpoch();
+
+    /// Assigns topological index \p Index to node \p N.
+    void allocate(unsigned N, int Index);
+
+    /// Picks the supportive vertices for a freshly built DAG.
+    void chooseSupportiveVertices();
+
+    /// Recomputes Level and ReachedBy of node \p N from its predecessors (if
+    /// \p Forward), or RLevel and Reaches from its successors. Returns true if
+    /// anything changed.
+    bool recompute(unsigned N, bool Forward);
+
+    /// Recomputes the labels of \p Touched and everything downstream (if \p
+    /// Forward) or upstream of them that changes as a result.
+    void propagate(ArrayRef<unsigned> Touched, bool Forward);
+
+    /// Restores the topological order after inserting an edge \p X -> \p Y.
+    void insertIntoOrder(unsigned X, unsigned Y);
+
+    /// Invalidates the cached facts that \p U may falsify.
+    void invalidateRows(const Update &U);
+
+    /// Returns the row for node \p N in \p Rows, evicting another if needed.
+    ReachRow &getRow(MutableArrayRef<ReachRow> Rows, unsigned &Clock,
+                     int NodeInfo::*RowOf, unsigned N);
+
+    Bounds bounds(ArrayRef<const SUnit *> SUs) const;
+
+    /// Can some node in \p From reach some node in \p To?
+    static Reach classify(const Bounds &From, const Bounds &To);
+
+    /// What does \p Row say about node \p N?
+    static Reach lookup(const ReachRow &Row, unsigned N);
+
+    /// Does any node in \p From reach any node in \p To? The sets must be
+    /// disjoint, and the labels up to date.
+    bool reaches(ArrayRef<const SUnit *> From, ArrayRef<const SUnit *> To);
+
+    void queueUpdate(SUnit *Pred, SUnit *Succ, bool IsInsert);
+
+    /// Fix the ordering and labels, by either recomputing from scratch or by
+    /// applying any outstanding updates.
+    LLVM_ABI void FixOrder();
 
   public:
+    /// Edges to \p ExitSU, like edges to any node outside \p SUnits, are
+    /// ignored.
     LLVM_ABI ScheduleDAGTopologicalSort(std::vector<SUnit> &SUnits,
                                         SUnit *ExitSU);
 
@@ -800,39 +919,50 @@ class TargetRegisterInfo;
     /// Checks if \p SU is reachable from \p TargetSU.
     LLVM_ABI bool IsReachable(const SUnit *SU, const SUnit *TargetSU);
 
+    /// Checks if any of \p SUs is reachable from any of \p TargetSUs. The two
+    /// sets must be disjoint.
+    LLVM_ABI bool IsReachable(ArrayRef<const SUnit *> SUs,
+                              ArrayRef<const SUnit *> TargetSUs);
+
     /// Returns true if addPred(TargetSU, SU) creates a cycle.
     LLVM_ABI bool WillCreateCycle(SUnit *TargetSU, SUnit *SU);
 
-    /// Updates the topological ordering to accommodate an edge to be
-    /// added from SUnit \p X to SUnit \p Y.
+    /// Queues an update for an edge to be added from SUnit \p X to SUnit \p Y.
+    /// The edge may be added to the DAG after this call, so the update can't be
+    /// applied eagerly; this is the same as AddPredQueued.
     LLVM_ABI void AddPred(SUnit *Y, SUnit *X);
 
-    /// Queues an update to the topological ordering to accommodate an edge to
-    /// be added from SUnit \p X to SUnit \p Y.
+    /// Queues an update for an edge to be added from SUnit \p X to SUnit \p Y.
     LLVM_ABI void AddPredQueued(SUnit *Y, SUnit *X);
 
-    /// Updates the topological ordering to accommodate an edge to be
-    /// removed from the specified node \p N from the predecessors of the
-    /// current node \p M.
+    /// Queues an update for an edge to be removed from the specified node \p N
+    /// from the predecessors of the current node \p M.
     LLVM_ABI void RemovePred(SUnit *M, SUnit *N);
 
     /// Mark the ordering as temporarily broken, after a new node has been
     /// added.
     void MarkDirty() { Dirty = true; }
 
+    /// Iteration applies any outstanding updates first.
     typedef std::vector<int>::iterator iterator;
-    typedef std::vector<int>::const_iterator const_iterator;
-    iterator begin() { return Index2Node.begin(); }
-    const_iterator begin() const { return Index2Node.begin(); }
-    iterator end() { return Index2Node.end(); }
-    const_iterator end() const { return Index2Node.end(); }
+    iterator begin() {
+      FixOrder();
+      return Index2Node.begin();
+    }
+    iterator end() {
+      FixOrder();
+      return Index2Node.end();
+    }
 
     typedef std::vector<int>::reverse_iterator reverse_iterator;
-    typedef std::vector<int>::const_reverse_iterator const_reverse_iterator;
-    reverse_iterator rbegin() { return Index2Node.rbegin(); }
-    const_reverse_iterator rbegin() const { return Index2Node.rbegin(); }
-    reverse_iterator rend() { return Index2Node.rend(); }
-    const_reverse_iterator rend() const { return Index2Node.rend(); }
+    reverse_iterator rbegin() {
+      FixOrder();
+      return Index2Node.rbegin();
+    }
+    reverse_iterator rend() {
+      FixOrder();
+      return Index2Node.rend();
+    }
   };
 
 } // end namespace llvm

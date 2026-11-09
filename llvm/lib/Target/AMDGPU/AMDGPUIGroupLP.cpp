@@ -589,7 +589,7 @@ void PipelineSolver::removeEdges(
       return P.getSUnit() == Pred && P.isArtificial();
     });
     if (Match != Succ->Preds.end())
-      Succ->removePred(*Match);
+      DAG->removeEdge(Succ, *Match);
   }
 }
 

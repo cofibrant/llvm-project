@@ -99,7 +99,7 @@ static void removeExportDependencies(ScheduleDAGInstrs *DAG, SUnit &SU) {
   }
 
   for (SDep Pred : ToRemove)
-    SU.removePred(Pred);
+    DAG->removeEdge(&SU, Pred);
   for (SDep Pred : ToAdd)
     DAG->addEdge(&SU, Pred);
 }

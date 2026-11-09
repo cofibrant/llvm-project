@@ -316,6 +316,10 @@ namespace llvm {
     /// equivalent edge already existed (false indicates failure).
     bool addEdge(SUnit *SuccSU, const SDep &PredDep);
 
+    /// Remove a DAG edge from the given SU, keeping the topological ordering
+    /// informed. Use this rather than SUnit::removePred once the DAG is built.
+    void removeEdge(SUnit *SuccSU, const SDep &PredDep);
+
     /// Returns the array of the clusters.
     SmallVector<ClusterInfo> &getClusters() { return Clusters; }
 

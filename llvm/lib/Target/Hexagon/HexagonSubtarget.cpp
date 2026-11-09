@@ -296,7 +296,7 @@ void HexagonSubtarget::UsrOverflowMutation::apply(ScheduleDAGInstrs *DAG) {
       if (D.getKind() == SDep::Output && D.getReg() == Hexagon::USR_OVF)
         Erase.push_back(D);
     for (auto &E : Erase)
-      SU.removePred(E);
+      DAG->removeEdge(&SU, E);
   }
 }
 
