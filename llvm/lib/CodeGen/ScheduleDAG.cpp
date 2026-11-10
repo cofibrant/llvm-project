@@ -52,7 +52,7 @@ static cl::opt<bool> StressSchedOpt(
 #endif
 
 static cl::opt<unsigned> TopoSupportiveVertices(
-    "sched-topo-supportive-vertices", cl::Hidden, cl::init(4),
+    "sched-topo-supportive-vertices", cl::Hidden, cl::init(16),
     cl::desc("Number of supportive vertices used to answer reachability "
              "queries on scheduling DAGs (at most 32)"));
 
@@ -473,11 +473,12 @@ unsigned ScheduleDAG::VerifyScheduledDAG(bool isBottomUp) {
 //   that follow Y ahead of the descendants of Y that precede X, reusing their
 //   indices. Nothing else moves. Removals never invalidate the order.
 //
-// * Supportive vertices: a node's ReachedBy only depends on its predecessors'
-//   (and Reaches on its successors'), so they are recomputed in topological
-//   order, starting from the endpoints of the updated edges and stopping
-//   wherever nothing changes. This doesn't need to know whether an update
-//   really changed the edge set (e.g. addPred may find an existing edge).
+// * Levels and supportive vertices: a node's Level and ReachedBy only depend on
+//   its predecessors' (and RLevel and Reaches on its successors'), so they are
+//   recomputed in topological order, starting from the endpoints of the updated
+//   edges and stopping wherever nothing changes. This doesn't need to know
+//   whether an update really changed the edge set (e.g. addPred may find an
+//   existing edge).
 //
 // * Cached rows: a path that an inserted edge X->Y completes reaches X, and
 //   leaves Y, along edges that were already present; likewise for a path that
@@ -589,17 +590,21 @@ void ScheduleDAGTopologicalSort::chooseSupportiveVertices() {
 
 bool ScheduleDAGTopologicalSort::recompute(unsigned N, bool Forward) {
   NodeInfo &NI = Info[N];
+  unsigned Level = 0;
   uint32_t Mask = NI.Self;
   for (const SDep &Dep : Forward ? SUnits[N].Preds : SUnits[N].Succs) {
     const SUnit *Other = Dep.getSUnit();
     if (!inDAG(Other))
       continue;
     const NodeInfo &OI = Info[Other->NodeNum];
+    Level = std::max(Level, (Forward ? OI.Level : OI.RLevel) + 1);
     Mask |= Forward ? OI.ReachedBy : OI.Reaches;
   }
+  unsigned &OldLevel = Forward ? NI.Level : NI.RLevel;
   uint32_t &OldMask = Forward ? NI.ReachedBy : NI.Reaches;
-  if (Mask == OldMask)
+  if (Level == OldLevel && Mask == OldMask)
     return false;
+  OldLevel = Level;
   OldMask = Mask;
   return true;
 }
@@ -836,19 +841,26 @@ std::vector<int> ScheduleDAGTopologicalSort::GetSubGraph(const SUnit &StartSU,
 
 struct ScheduleDAGTopologicalSort::Bounds {
   int MinIndex, MaxIndex;
+  unsigned MinLevel, MaxLevel;
+  unsigned MinRLevel, MaxRLevel;
   /// Supportive vertices that reach any (all) of the nodes, and that any (all)
   /// of the nodes reach.
   uint32_t AnyReachedBy, AllReachedBy;
   uint32_t AnyReaches, AllReaches;
 
   explicit Bounds(const NodeInfo &NI)
-      : MinIndex(NI.Index), MaxIndex(NI.Index), AnyReachedBy(NI.ReachedBy),
-        AllReachedBy(NI.ReachedBy), AnyReaches(NI.Reaches),
-        AllReaches(NI.Reaches) {}
+      : MinIndex(NI.Index), MaxIndex(NI.Index), MinLevel(NI.Level),
+        MaxLevel(NI.Level), MinRLevel(NI.RLevel), MaxRLevel(NI.RLevel),
+        AnyReachedBy(NI.ReachedBy), AllReachedBy(NI.ReachedBy),
+        AnyReaches(NI.Reaches), AllReaches(NI.Reaches) {}
 
   void add(const NodeInfo &NI) {
     MinIndex = std::min(MinIndex, NI.Index);
     MaxIndex = std::max(MaxIndex, NI.Index);
+    MinLevel = std::min(MinLevel, NI.Level);
+    MaxLevel = std::max(MaxLevel, NI.Level);
+    MinRLevel = std::min(MinRLevel, NI.RLevel);
+    MaxRLevel = std::max(MaxRLevel, NI.RLevel);
     AnyReachedBy |= NI.ReachedBy;
     AllReachedBy &= NI.ReachedBy;
     AnyReaches |= NI.Reaches;
@@ -869,8 +881,9 @@ ScheduleDAGTopologicalSort::bounds(ArrayRef<const SUnit *> SUs) const {
 
 ScheduleDAGTopologicalSort::Reach
 ScheduleDAGTopologicalSort::classify(const Bounds &From, const Bounds &To) {
-  // Every edge increases Index.
-  if (From.MinIndex >= To.MaxIndex)
+  // Every edge increases Index and Level, and decreases RLevel.
+  if (From.MinIndex >= To.MaxIndex || From.MinLevel >= To.MaxLevel ||
+      From.MaxRLevel <= To.MinRLevel)
     return Reach::No;
   // Some node in From reaches a supportive vertex that reaches some node in To.
   if (From.AnyReaches & To.AnyReachedBy)
