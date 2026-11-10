@@ -28,7 +28,6 @@
 #include "llvm/Support/ErrorHandling.h"
 #include <cassert>
 #include <cstddef>
-#include <cstdint>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -743,8 +742,6 @@ class TargetRegisterInfo;
   ///   - the topological order: X can only reach Y if Index(X) < Index(Y);
   ///   - longest-path levels from the sources and to the sinks, which strictly
   ///     increase (resp. decrease) along every edge;
-  ///   - a few supportive vertices S, for which the nodes reaching S and the
-  ///     nodes reachable from S are maintained exactly;
   ///   - cached rows of facts about single nodes, recorded by earlier queries.
   /// If those are inconclusive, a bidirectional search applies the same tests
   /// at every node it reaches, and records what it learns in the cache.
@@ -760,12 +757,6 @@ class TargetRegisterInfo;
       /// Length of the longest path from a source, and to a sink.
       unsigned Level = 0;
       unsigned RLevel = 0;
-      /// Bit I is set if supportive vertex I reaches this node, or this node
-      /// reaches supportive vertex I. A supportive vertex reaches itself.
-      uint32_t ReachedBy = 0;
-      uint32_t Reaches = 0;
-      /// Bit I is set if this node is supportive vertex I.
-      uint32_t Self = 0;
       /// This node's rows in DescRows and AncRows, or -1.
       int DescRow = -1;
       int AncRow = -1;
@@ -855,12 +846,8 @@ class TargetRegisterInfo;
     /// Assigns topological index \p Index to node \p N.
     void allocate(unsigned N, int Index);
 
-    /// Picks the supportive vertices for a freshly built DAG.
-    void chooseSupportiveVertices();
-
-    /// Recomputes Level and ReachedBy of node \p N from its predecessors (if
-    /// \p Forward), or RLevel and Reaches from its successors. Returns true if
-    /// anything changed.
+    /// Recomputes Level of node \p N from its predecessors (if \p Forward), or
+    /// RLevel from its successors. Returns true if it changed.
     bool recompute(unsigned N, bool Forward);
 
     /// Recomputes the labels of \p Touched and everything downstream (if \p
