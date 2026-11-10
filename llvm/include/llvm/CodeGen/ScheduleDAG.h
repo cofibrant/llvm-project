@@ -744,9 +744,10 @@ class TargetRegisterInfo;
   ///   - longest-path levels from the sources and to the sinks, which strictly
   ///     increase (resp. decrease) along every edge;
   ///   - a few supportive vertices S, for which the nodes reaching S and the
-  ///     nodes reachable from S are maintained exactly.
+  ///     nodes reachable from S are maintained exactly;
+  ///   - cached rows of facts about single nodes, recorded by earlier queries.
   /// If those are inconclusive, a bidirectional search applies the same tests
-  /// at every node it reaches.
+  /// at every node it reaches, and records what it learns in the cache.
   ///
   /// Updates are queued and applied at the next query or iteration. Every edge
   /// insertion and removal must be reported, through AddPred/AddPredQueued and
@@ -765,9 +766,46 @@ class TargetRegisterInfo;
       uint32_t Reaches = 0;
       /// Bit I is set if this node is supportive vertex I.
       uint32_t Self = 0;
+      /// This node's rows in DescRows and AncRows, or -1.
+      int DescRow = -1;
+      int AncRow = -1;
       /// Traversal marks, set when equal to Epoch.
       unsigned FwdMark = 0;
       unsigned BwdMark = 0;
+    };
+
+    /// Cached facts about one node: the nodes it is known to reach (or to be
+    /// reached by), and the nodes it is known not to. Insertions can only
+    /// falsify negative facts, and removals positive ones.
+    struct ReachRow {
+      int Node = -1;
+      /// Set on use, and cleared by the eviction sweep.
+      bool Referenced = false;
+      bool PosValid = false;
+      bool NegValid = false;
+      BitVector Pos;
+      BitVector Neg;
+
+      void reset(unsigned NumNodes) {
+        Node = -1;
+        Referenced = PosValid = NegValid = false;
+        Pos.resize(NumNodes);
+        Neg.resize(NumNodes);
+      }
+      BitVector &validPos() {
+        if (!PosValid) {
+          Pos.reset();
+          PosValid = true;
+        }
+        return Pos;
+      }
+      BitVector &validNeg() {
+        if (!NegValid) {
+          Neg.reset();
+          NegValid = true;
+        }
+        return Neg;
+      }
     };
 
     /// An edge insertion or removal that has not been applied yet.
@@ -795,6 +833,17 @@ class TargetRegisterInfo;
     std::vector<int> Index2Node;
     /// Labels for each node, indexed by node number.
     std::vector<NodeInfo> Info;
+
+    /// Are levels, supportive vertices and cached rows maintained? Small DAGs
+    /// only use the order.
+    bool Labelled = false;
+
+    /// Cached rows: descendants of a source, and ancestors of a target. Each
+    /// pool is replaced by a second-chance sweep driven by its clock.
+    SmallVector<ReachRow, 0> DescRows;
+    SmallVector<ReachRow, 0> AncRows;
+    unsigned DescClock = 0;
+    unsigned AncClock = 0;
 
     /// Scratch space for traversals, retained to avoid reallocation.
     unsigned Epoch = 0;
@@ -825,10 +874,20 @@ class TargetRegisterInfo;
     /// Restores the topological order after inserting an edge \p X -> \p Y.
     void insertIntoOrder(unsigned X, unsigned Y);
 
+    /// Invalidates the cached facts that \p U may falsify.
+    void invalidateRows(const Update &U);
+
+    /// Returns the row for node \p N in \p Rows, evicting another if needed.
+    ReachRow &getRow(MutableArrayRef<ReachRow> Rows, unsigned &Clock,
+                     int NodeInfo::*RowOf, unsigned N);
+
     Bounds bounds(ArrayRef<const SUnit *> SUs) const;
 
     /// Can some node in \p From reach some node in \p To?
-    static Reach classify(const Bounds &From, const Bounds &To);
+    Reach classify(const Bounds &From, const Bounds &To) const;
+
+    /// What does \p Row say about node \p N?
+    static Reach lookup(const ReachRow &Row, unsigned N);
 
     /// Does any node in \p From reach any node in \p To? The sets must be
     /// disjoint, and the labels up to date.
