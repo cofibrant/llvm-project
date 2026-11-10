@@ -28,7 +28,6 @@
 #include "llvm/Support/ErrorHandling.h"
 #include <cassert>
 #include <cstddef>
-#include <cstdint>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -736,15 +735,10 @@ class TargetRegisterInfo;
   };
 
   /// This class maintains a topological ordering of a DAG's SUnits, together
-  /// with labels that answer most reachability queries without a traversal, as
-  /// edges are added and removed.
+  /// with a cache of reachability facts, as edges are added and removed.
   ///
   /// A query is first checked against O(1) tests:
   ///   - the topological order: X can only reach Y if Index(X) < Index(Y);
-  ///   - longest-path levels from the sources and to the sinks, which strictly
-  ///     increase (resp. decrease) along every edge;
-  ///   - a few supportive vertices S, for which the nodes reaching S and the
-  ///     nodes reachable from S are maintained exactly;
   ///   - cached rows of facts about single nodes, recorded by earlier queries.
   /// If those are inconclusive, a bidirectional search applies the same tests
   /// at every node it reaches, and records what it learns in the cache.
@@ -757,15 +751,6 @@ class TargetRegisterInfo;
     struct NodeInfo {
       /// Topological index.
       int Index = 0;
-      /// Length of the longest path from a source, and to a sink.
-      unsigned Level = 0;
-      unsigned RLevel = 0;
-      /// Bit I is set if supportive vertex I reaches this node, or this node
-      /// reaches supportive vertex I. A supportive vertex reaches itself.
-      uint32_t ReachedBy = 0;
-      uint32_t Reaches = 0;
-      /// Bit I is set if this node is supportive vertex I.
-      uint32_t Self = 0;
       /// This node's rows in DescRows and AncRows, or -1.
       int DescRow = -1;
       int AncRow = -1;
@@ -844,7 +829,6 @@ class TargetRegisterInfo;
     /// Scratch space for traversals, retained to avoid reallocation.
     unsigned Epoch = 0;
     std::vector<unsigned> FwdStack, BwdStack, FwdSeen, BwdSeen;
-    std::vector<std::pair<int, unsigned>> Heap;
 
     /// Edges to nodes outside the DAG (e.g. ExitSU) are allowed but ignored.
     bool inDAG(const SUnit *SU) const { return SU->NodeNum < Info.size(); }
@@ -854,18 +838,6 @@ class TargetRegisterInfo;
 
     /// Assigns topological index \p Index to node \p N.
     void allocate(unsigned N, int Index);
-
-    /// Picks the supportive vertices for a freshly built DAG.
-    void chooseSupportiveVertices();
-
-    /// Recomputes Level and ReachedBy of node \p N from its predecessors (if
-    /// \p Forward), or RLevel and Reaches from its successors. Returns true if
-    /// anything changed.
-    bool recompute(unsigned N, bool Forward);
-
-    /// Recomputes the labels of \p Touched and everything downstream (if \p
-    /// Forward) or upstream of them that changes as a result.
-    void propagate(ArrayRef<unsigned> Touched, bool Forward);
 
     /// Restores the topological order after inserting an edge \p X -> \p Y.
     void insertIntoOrder(unsigned X, unsigned Y);

@@ -28,7 +28,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
-#include <functional>
 #include <iterator>
 #include <limits>
 #include <utility>
@@ -50,11 +49,6 @@ static cl::opt<bool> StressSchedOpt(
   "stress-sched", cl::Hidden, cl::init(false),
   cl::desc("Stress test instruction scheduling"));
 #endif
-
-static cl::opt<unsigned> TopoSupportiveVertices(
-    "sched-topo-supportive-vertices", cl::Hidden, cl::init(16),
-    cl::desc("Number of supportive vertices used to answer reachability "
-             "queries on scheduling DAGs (at most 32)"));
 
 /// Recomputing from scratch is likely more efficient than applying too many
 /// queued updates one-by-one. The cut-off is arbitrarily chosen.
@@ -466,19 +460,12 @@ unsigned ScheduleDAG::VerifyScheduledDAG(bool isBottomUp) {
 // Reachability in Large Graphs" by Kathrin Hanauer, Christian Schulz and
 // Jonathan Trummer.
 //
-// InitDAGTopologicalSorting computes all the labels from scratch, and FixOrder
-// applies the queued updates to them incrementally:
+// InitDAGTopologicalSorting computes the order from scratch, and FixOrder
+// applies the queued updates incrementally:
 //
 // * Order: inserting X->Y with Index(Y) < Index(X) moves the ancestors of X
 //   that follow Y ahead of the descendants of Y that precede X, reusing their
 //   indices. Nothing else moves. Removals never invalidate the order.
-//
-// * Levels and supportive vertices: a node's Level and ReachedBy only depend on
-//   its predecessors' (and RLevel and Reaches on its successors'), so they are
-//   recomputed in topological order, starting from the endpoints of the updated
-//   edges and stopping wherever nothing changes. This doesn't need to know
-//   whether an update really changed the edge set (e.g. addPred may find an
-//   existing edge).
 //
 // * Cached rows: a path that an inserted edge X->Y completes reaches X, and
 //   leaves Y, along edges that were already present; likewise for a path that
@@ -539,12 +526,6 @@ void ScheduleDAGTopologicalSort::InitDAGTopologicalSorting() {
   }
   assert(Id == 0 && "DAG contains a cycle");
 
-  chooseSupportiveVertices();
-  for (unsigned Idx = 0; Idx != DAGSize; ++Idx)
-    recompute(Index2Node[Idx], /*Forward=*/true);
-  for (unsigned Idx = DAGSize; Idx != 0; --Idx)
-    recompute(Index2Node[Idx - 1], /*Forward=*/false);
-
   DescRows.resize(NumReachRows);
   AncRows.resize(NumReachRows);
   for (ReachRow &Row : DescRows)
@@ -565,78 +546,6 @@ void ScheduleDAGTopologicalSort::InitDAGTopologicalSorting() {
     }
   }
 #endif
-}
-
-void ScheduleDAGTopologicalSort::chooseSupportiveVertices() {
-  // A supportive vertex can only answer queries about pairs that straddle it,
-  // so prefer nodes with many predecessors and many successors, like barriers.
-  unsigned NumSupportive = std::min<unsigned>(TopoSupportiveVertices, 32);
-  auto IsInDAG = [&](const SDep &Dep) { return inDAG(Dep.getSUnit()); };
-  SmallVector<std::pair<uint64_t, unsigned>, 0> Candidates;
-  for (const SUnit &SU : SUnits) {
-    uint64_t Score =
-        uint64_t(count_if(SU.Preds, IsInDAG)) * count_if(SU.Succs, IsInDAG);
-    if (Score)
-      Candidates.emplace_back(Score, SU.NodeNum);
-  }
-  if (Candidates.size() > NumSupportive) {
-    std::nth_element(Candidates.begin(), Candidates.begin() + NumSupportive,
-                     Candidates.end(), std::greater<>());
-    Candidates.resize(NumSupportive);
-  }
-  for (auto [I, Candidate] : enumerate(Candidates))
-    Info[Candidate.second].Self = 1u << I;
-}
-
-bool ScheduleDAGTopologicalSort::recompute(unsigned N, bool Forward) {
-  NodeInfo &NI = Info[N];
-  unsigned Level = 0;
-  uint32_t Mask = NI.Self;
-  for (const SDep &Dep : Forward ? SUnits[N].Preds : SUnits[N].Succs) {
-    const SUnit *Other = Dep.getSUnit();
-    if (!inDAG(Other))
-      continue;
-    const NodeInfo &OI = Info[Other->NodeNum];
-    Level = std::max(Level, (Forward ? OI.Level : OI.RLevel) + 1);
-    Mask |= Forward ? OI.ReachedBy : OI.Reaches;
-  }
-  unsigned &OldLevel = Forward ? NI.Level : NI.RLevel;
-  uint32_t &OldMask = Forward ? NI.ReachedBy : NI.Reaches;
-  if (Level == OldLevel && Mask == OldMask)
-    return false;
-  OldLevel = Level;
-  OldMask = Mask;
-  return true;
-}
-
-void ScheduleDAGTopologicalSort::propagate(ArrayRef<unsigned> Touched,
-                                           bool Forward) {
-  // Visit the affected nodes in topological order (reversed when going
-  // backward), so that each is recomputed once, after everything it depends
-  // on.
-  newEpoch();
-  Heap.clear();
-  auto Push = [&](unsigned N) {
-    NodeInfo &NI = Info[N];
-    unsigned &Mark = Forward ? NI.FwdMark : NI.BwdMark;
-    if (Mark == Epoch)
-      return;
-    Mark = Epoch;
-    Heap.emplace_back(Forward ? NI.Index : -NI.Index, N);
-    std::push_heap(Heap.begin(), Heap.end(), std::greater<>());
-  };
-  for (unsigned N : Touched)
-    Push(N);
-  while (!Heap.empty()) {
-    std::pop_heap(Heap.begin(), Heap.end(), std::greater<>());
-    unsigned N = Heap.back().second;
-    Heap.pop_back();
-    if (!recompute(N, Forward))
-      continue;
-    for (const SDep &Dep : Forward ? SUnits[N].Succs : SUnits[N].Preds)
-      if (inDAG(Dep.getSUnit()))
-        Push(Dep.getSUnit()->NodeNum);
-  }
 }
 
 void ScheduleDAGTopologicalSort::insertIntoOrder(unsigned X, unsigned Y) {
@@ -724,21 +633,13 @@ void ScheduleDAGTopologicalSort::FixOrder() {
   erase_if(Updates,
            [&](const Update &U) { return !inDAG(U.Pred) || !inDAG(U.Succ); });
 
-  // Restore the order first; everything below relies on it.
+  // Restore the order first; the row invalidation relies on it.
   for (const Update &U : Updates)
     if (U.IsInsert)
       insertIntoOrder(U.Pred->NodeNum, U.Succ->NodeNum);
-
-  SmallVector<unsigned, 16> FwdTouched, BwdTouched;
-  for (const Update &U : Updates) {
+  for (const Update &U : Updates)
     invalidateRows(U);
-    FwdTouched.push_back(U.Succ->NodeNum);
-    BwdTouched.push_back(U.Pred->NodeNum);
-  }
   Updates.clear();
-
-  propagate(FwdTouched, /*Forward=*/true);
-  propagate(BwdTouched, /*Forward=*/false);
 }
 
 void ScheduleDAGTopologicalSort::queueUpdate(SUnit *Pred, SUnit *Succ,
@@ -841,30 +742,13 @@ std::vector<int> ScheduleDAGTopologicalSort::GetSubGraph(const SUnit &StartSU,
 
 struct ScheduleDAGTopologicalSort::Bounds {
   int MinIndex, MaxIndex;
-  unsigned MinLevel, MaxLevel;
-  unsigned MinRLevel, MaxRLevel;
-  /// Supportive vertices that reach any (all) of the nodes, and that any (all)
-  /// of the nodes reach.
-  uint32_t AnyReachedBy, AllReachedBy;
-  uint32_t AnyReaches, AllReaches;
 
   explicit Bounds(const NodeInfo &NI)
-      : MinIndex(NI.Index), MaxIndex(NI.Index), MinLevel(NI.Level),
-        MaxLevel(NI.Level), MinRLevel(NI.RLevel), MaxRLevel(NI.RLevel),
-        AnyReachedBy(NI.ReachedBy), AllReachedBy(NI.ReachedBy),
-        AnyReaches(NI.Reaches), AllReaches(NI.Reaches) {}
+      : MinIndex(NI.Index), MaxIndex(NI.Index) {}
 
   void add(const NodeInfo &NI) {
     MinIndex = std::min(MinIndex, NI.Index);
     MaxIndex = std::max(MaxIndex, NI.Index);
-    MinLevel = std::min(MinLevel, NI.Level);
-    MaxLevel = std::max(MaxLevel, NI.Level);
-    MinRLevel = std::min(MinRLevel, NI.RLevel);
-    MaxRLevel = std::max(MaxRLevel, NI.RLevel);
-    AnyReachedBy |= NI.ReachedBy;
-    AllReachedBy &= NI.ReachedBy;
-    AnyReaches |= NI.Reaches;
-    AllReaches &= NI.Reaches;
   }
 };
 
@@ -881,17 +765,8 @@ ScheduleDAGTopologicalSort::bounds(ArrayRef<const SUnit *> SUs) const {
 
 ScheduleDAGTopologicalSort::Reach
 ScheduleDAGTopologicalSort::classify(const Bounds &From, const Bounds &To) {
-  // Every edge increases Index and Level, and decreases RLevel.
-  if (From.MinIndex >= To.MaxIndex || From.MinLevel >= To.MaxLevel ||
-      From.MaxRLevel <= To.MinRLevel)
-    return Reach::No;
-  // Some node in From reaches a supportive vertex that reaches some node in To.
-  if (From.AnyReaches & To.AnyReachedBy)
-    return Reach::Yes;
-  // A supportive vertex reaches all of From but none of To, or all of To reach
-  // a supportive vertex that none of From reaches.
-  if ((From.AllReachedBy & ~To.AnyReachedBy) ||
-      (To.AllReaches & ~From.AnyReaches))
+  // Every edge increases Index.
+  if (From.MinIndex >= To.MaxIndex)
     return Reach::No;
   return Reach::Unknown;
 }
